@@ -1,0 +1,38 @@
+# ViT-Small experiment config
+# Reproduces paper Table 1, row "ViT-S/16 (22M) — ImageNet-100"
+
+_base_: base.yaml
+
+model:
+  name: vit
+  patch_size: 16
+  image_size: 224
+  d_model: 384
+  n_layers: 12
+  n_head: 6
+  num_classes: 100
+  dropout: 0.1
+
+dataset:
+  name: imagenet100
+  batch_size: 256
+  num_workers: 8
+  augment: [random_resized_crop, random_horizontal_flip, color_jitter]
+
+training:
+  steps: 20000
+  seed: 42
+  mixed_precision: true
+
+optimizer:
+  lr: 1.0e-3
+  warmup_steps: 2000
+  precond_freq: 100
+  min_precond_updates: 20
+  k_max: 128
+  tau: 5.0
+
+logging:
+  log_every: 200
+  val_every: 1000
+  metric: top1_accuracy

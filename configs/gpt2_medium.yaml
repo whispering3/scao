@@ -1,0 +1,49 @@
+# GPT-2 Medium (345M parameters) — paper benchmark
+# Equivalent to: d_model=1024, n_layers=24, n_head=16
+# Run with: python scripts/run_experiment.py --config configs/gpt2_medium.yaml
+# Requires: ~24 GB VRAM (A100/H100 recommended)
+
+experiment:
+  name: scao_gpt2_medium
+  seeds: [42, 1337, 2024]
+
+model:
+  scale: "350m"
+  d_model: 1024
+  n_layers: 24
+  n_head: 16
+  d_ff: 4096
+  seq_len: 1024
+
+training:
+  steps: 10000
+  batch_size: 4
+  warmup_steps: 500
+  device: cuda
+  grad_clip: 1.0
+
+optimizers:
+  adamw:
+    lr: 2.5e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+
+  scao:
+    lr: 2.5e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    precond_freq: 50
+    min_precond_updates: 10
+    k_min: 8
+    k_max: 64
+    tau: null
+
+  diag_shampoo:
+    lr: 2.5e-4
+    weight_decay: 0.1
+
+logging:
+  val_every: 500
+  save_csv: results/gpt2_medium.csv
+  save_curves: results/gpt2_medium_curves.csv

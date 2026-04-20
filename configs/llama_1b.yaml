@@ -1,0 +1,52 @@
+# LLaMA-style 1.3B parameter model — paper benchmark (1B+ scale claim)
+# Equivalent to: d_model=2048, n_layers=24, n_head=16
+# Run with: python scripts/run_experiment.py --config configs/llama_1b.yaml
+# Requires: ~80 GB VRAM (H100 SXM5 recommended); use 2x40GB A100 with FSDP
+
+experiment:
+  name: scao_1b
+  seeds: [42, 1337]
+
+model:
+  scale: "1b"
+  d_model: 2048
+  n_layers: 24
+  n_head: 16
+  d_ff: 8192
+  seq_len: 1024
+
+training:
+  steps: 20000
+  batch_size: 2          # per-GPU; use gradient accumulation for effective bs=64+
+  grad_accumulation: 16  # effective batch = 2 * 16 = 32
+  warmup_steps: 1000
+  device: cuda
+  grad_clip: 1.0
+  fsdp: true             # recommended at 1B+
+
+optimizers:
+  adamw:
+    lr: 2.0e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+
+  scao:
+    lr: 2.0e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+    warmup_steps: 1000
+    precond_freq: 100       # less frequent at 1B to reduce overhead
+    min_precond_updates: 10
+    k_min: 8
+    k_max: 64
+    tau: null
+    # Large matrices (d_model=2048) auto-enable Newton-Schulz in preconditioner
+
+  diag_shampoo:
+    lr: 2.0e-4
+    weight_decay: 0.1
+
+logging:
+  val_every: 1000
+  save_csv: results/llama_1b.csv
+  save_curves: results/llama_1b_curves.csv

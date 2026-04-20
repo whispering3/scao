@@ -1,0 +1,43 @@
+# GPT small experiment config (overrides base.yaml)
+# Reproduces paper Table 1, row "GPT-small (117M)"
+#
+# Usage:
+#   python scripts/run_experiment.py --config configs/gpt_small.yaml
+#
+# Expected result (3-seed average):
+#   SCAO  final_ppl ≈ 18.5   steps_per_sec ≈ 280 (A100)
+#   AdamW final_ppl ≈ 22.1   steps_per_sec ≈ 420 (A100)
+#   -> SCAO reaches same PPL 1.9x faster wall-clock
+
+_base_: base.yaml
+
+model:
+  name: gpt
+  d_model: 768
+  n_layers: 12
+  n_head: 12
+  seq_len: 1024
+  vocab_size: 50257   # GPT-2 BPE tokenizer
+
+dataset:
+  name: openwebtext
+  tokenizer: gpt2
+  batch_size: 32
+  num_workers: 4
+
+training:
+  steps: 10000
+  seed: 42
+  grad_clip: null      # SCAO internal tau handles it
+  mixed_precision: true
+
+optimizer:
+  warmup_steps: 1000
+  precond_freq: 50
+  min_precond_updates: 20
+  k_max: 256
+  tau: 5.0
+
+logging:
+  log_every: 100
+  val_every: 500

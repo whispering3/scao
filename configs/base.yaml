@@ -1,0 +1,30 @@
+# SCAO base hyperparameter configuration
+# All experiments inherit from this unless overridden.
+
+optimizer:
+  name: scao
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  eps: 1.0e-8
+
+  # Preconditioner
+  precond_freq: 10        # steps between curvature updates
+  min_precond_updates: 10 # wait for N reliable curvature samples before SCAO phase
+  warmup_steps: 100       # Adam warmup before SCAO
+  rho: 0.999              # EMA decay for curvature factors
+  epsilon_sparse: 0.05    # spectral mass fraction to discard
+  k_min: 8
+  k_max: 128
+  max_precond_dim: 4096
+  tau: null               # set to float for curvature-aware clipping
+
+training:
+  seed: 42
+  grad_clip: null         # SCAO handles clipping internally via tau
+  mixed_precision: false  # set to true for bfloat16 on CUDA
+
+logging:
+  log_every: 50
+  val_every: 50
+  save_dir: logs/

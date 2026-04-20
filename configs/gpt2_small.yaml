@@ -1,0 +1,48 @@
+# GPT-2 Small (117M parameters) — paper benchmark
+# Equivalent to: d_model=768, n_layers=12, n_head=12
+# Run with: python scripts/run_experiment.py --config configs/gpt2_small.yaml
+
+experiment:
+  name: scao_gpt2_small
+  seeds: [42, 1337, 2024]
+
+model:
+  scale: "125m"        # maps to ModelConfig in gpt_scale_benchmark.py
+  d_model: 768
+  n_layers: 12
+  n_head: 12
+  d_ff: 3072
+  seq_len: 1024
+
+training:
+  steps: 5000
+  batch_size: 8
+  warmup_steps: 200
+  device: cuda
+  grad_clip: 1.0      # only for non-SCAO baselines
+
+optimizers:
+  adamw:
+    lr: 3.0e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+
+  scao:
+    lr: 3.0e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+    warmup_steps: 200
+    precond_freq: 50        # update curvature every 50 steps
+    min_precond_updates: 10
+    k_min: 8
+    k_max: 64
+    tau: null               # auto adaptive sparsity
+
+  diag_shampoo:
+    lr: 3.0e-4
+    weight_decay: 0.1
+
+logging:
+  val_every: 200
+  save_csv: results/gpt2_small.csv
+  save_curves: results/gpt2_small_curves.csv
