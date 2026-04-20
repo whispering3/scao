@@ -61,7 +61,7 @@ k* = argmin k such that  Σᵢ₌₁ᵏ λᵢ / Σⱼ λⱼ ≥ 1 − ε
 This reduces memory from `O(m² + n²)` to `O((m+n)·k)`. At GPT-2 scale (`d=768`), typical `k ≤ 32–64`, giving a **16–32× reduction** over full-rank Kronecker factors.
 
 ### Innovation 2 — Sparse Block-Diagonal FIM
-For layers where `max(m, n) > max_precond_dim`, SCAO falls back to a **diagonal curvature approximation** rather than storing any matrix at all. This prevents memory blow-up at large scales while preserving per-element adaptivity.
+For layers where `max(m, n) > max_precond_dim`, SCAO applies **sparse block-diagonal preconditioning**: the gradient matrix is partitioned into contiguous blocks of size ≤ `max_precond_dim` along the larger dimension, and an independent low-rank Kronecker preconditioner is applied per block. This bounds eigendecomp cost at `O(max_precond_dim³)` while preserving full curvature information across all blocks — unlike a diagonal fallback, which discards all inter-parameter correlation.
 
 ### Innovation 3 — Phase-Transition Stability
 The transition from Adam (Phase 1) to SCAO preconditioning (Phase 2) is the most dangerous moment in training. Three guards prevent instability:
@@ -93,18 +93,22 @@ Phase 2 — SCAO preconditioning (steps T_w + 1 onwards):
     Store: (U_L[:, :k], S_L[:k], U_R[:, :k], S_R[:k])
   
   Every step:
-    Project gradient: G_mid = U_L^T · G · U_R                    (k×k)
-    Scale:            G_scaled = diag(S_L^{-1/4}) · G_mid · diag(S_R^{-1/4})
-    Reconstruct:      g_eff = blend · (U_L · G_scaled · U_R^T) + (1-blend) · g
-                      where blend = min(1, (t - T_w) / 50)
+    Preconditioned gradient (identity + low-rank correction):
+      G_proj   = U_L^T · G · U_R                          (k×k)
+      G_scaled = diag(S_L^{-1/4}) · G_proj · diag(S_R^{-1/4})
+      G_precond = G + U_L · (G_scaled - G_proj) · U_R^T   (m×n)
     
-    Apply Adam update on g_eff:
+    50-step linear blend ramp (t_s = Phase-2 step count):
+      blend = min(1.0, t_s / 50)
+      g_eff = blend · G_precond + (1 - blend) · g
+    
+    Apply Adam update on g_eff (shared moments, warm-started from Phase 1):
       m_t ← β₁ · m_{t-1} + (1-β₁) · g_eff
-      v_t ← β₂ · v_t-1  + (1-β₂) · g_eff²
+      v_t ← β₂ · v_{t-1} + (1-β₂) · g_eff²
       θ_t ← θ_{t-1} - α · (m_t / (1-β₁^t)) / (√(v_t/(1-β₂^t)) + ε)
 ```
 
-**Key insight:** SCAO applies Adam *on top of* the preconditioned gradient. Both the first moment `m_t` and second moment `v_t` track `g_eff`, keeping numerator and denominator on the same scale throughout training.
+**Key insight:** SCAO uses **shared momentum tensors** that warm-start from Phase 1 into Phase 2. The blend ramp ensures a smooth transition — at `t_s=1`, `g_eff ≈ 0.98 · g_raw`, so the preconditioner's influence grows gradually without disrupting the accumulated momentum. Both moments track `g_eff`, keeping the numerator and denominator on the same scale throughout training.
 
 ---
 

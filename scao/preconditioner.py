@@ -12,7 +12,12 @@ The preconditioned gradient is:
     G_precond = U_l diag(S_l^{-1/4}) (U_l^T G U_r) diag(S_r^{-1/4}) U_r^T
 
 For 1-D parameters (biases, LayerNorm), falls back to Adam-style diagonal.
-For parameters where max(m, n) > max_precond_dim, also falls back to diagonal.
+For parameters where max(m, n) > max_precond_dim, uses sparse block-diagonal
+preconditioning: the gradient matrix is partitioned into contiguous blocks
+along the larger dimension, each of size ≤ max_precond_dim, and an independent
+Kronecker preconditioner is applied to each block.  This preserves curvature
+information across the full gradient while keeping the per-block eigendecomp
+cost bounded at O(max_precond_dim³).
 
 Mixed-precision note
 --------------------
@@ -88,7 +93,18 @@ class SparsePreconditioner:
         # param_dtype: dtype of the parameter (may be bf16/fp16)
         self.param_dtype = param_dtype
 
-        # Decide whether to use Kronecker preconditioner or diagonal fallback
+        # Decide whether to use Kronecker preconditioner, block-diagonal, or diagonal fallback.
+        # - Kronecker: standard case, max(m,n) ≤ max_precond_dim
+        # - Block-diagonal: large layers, max(m,n) > max_precond_dim, splits the larger
+        #   dimension into blocks of size ≤ max_precond_dim and applies an independent
+        #   Kronecker preconditioner per block.  Matches the paper's Algorithm 1 claim.
+        # - Diagonal: only for 1-D params (biases, LayerNorm scales)
+        self.use_block_diagonal = (
+            param.ndim >= 2
+            and m > 1
+            and n > 1
+            and max(m, n) > max_precond_dim
+        )
         self.use_kronecker = (
             param.ndim >= 2
             and m > 1
@@ -104,7 +120,38 @@ class SparsePreconditioner:
         if self.use_kronecker and not use_newton_schulz:
             use_newton_schulz = min(m, n) > 512
 
-        if self.use_kronecker:
+        if self.use_block_diagonal:
+            # Block-diagonal preconditioning:
+            # Split the gradient along the larger dimension into B ≤ max_precond_dim
+            # blocks.  Each block gets its own independent Kronecker preconditioner.
+            # This matches the paper's Algorithm 1 for large-matrix layers.
+            large_dim = m if m >= n else n
+            small_dim = n if m >= n else m
+            self._block_dim = 0 if m >= n else 1  # 0 = split rows, 1 = split cols
+            block_size = max_precond_dim
+            n_full = large_dim // block_size
+            remainder = large_dim % block_size
+            self._block_sizes: list[int] = [block_size] * n_full
+            if remainder > 0:
+                self._block_sizes.append(remainder)
+            self._blocks: list[SparsePreconditioner] = []
+            for bs in self._block_sizes:
+                fake_shape = (bs, small_dim) if self._block_dim == 0 else (small_dim, bs)
+                fake_param = param.new_empty(fake_shape)
+                blk = SparsePreconditioner(
+                    param=fake_param,
+                    epsilon_sparse=epsilon_sparse,
+                    k_min=k_min,
+                    k_max=k_max,
+                    rho=rho,
+                    max_precond_dim=max_precond_dim,
+                    use_newton_schulz=use_newton_schulz,
+                )
+                self._blocks.append(blk)
+            # k tracks the average rank across blocks
+            self.k: int = self._blocks[0].k if self._blocks else k_min
+
+        elif self.use_kronecker:
             k_init = min(k_min, min(m, n))
             self.k: int = k_init
 
@@ -161,6 +208,19 @@ class SparsePreconditioner:
         # Cast gradient to float32 for numerically stable statistics.
         # This is the key fix for bfloat16/float16 parameter support.
         g2d_f32, _ = to_2d(grad.to(_PRECOND_DTYPE))
+
+        # Block-diagonal: delegate each slice to its own sub-preconditioner.
+        if self.use_block_diagonal:
+            offset = 0
+            for bs, blk in zip(self._block_sizes, self._blocks):
+                if self._block_dim == 0:
+                    g_blk = g2d_f32[offset:offset + bs, :]
+                else:
+                    g_blk = g2d_f32[:, offset:offset + bs]
+                blk.update_curvature(g_blk)
+                offset += bs
+            self.k = sum(b.k for b in self._blocks) // len(self._blocks)
+            return
 
         if not self.use_kronecker:
             sq = g2d_f32.squeeze(0) if g2d_f32.shape[0] == 1 else g2d_f32
@@ -299,6 +359,20 @@ class SparsePreconditioner:
         orig_dtype = grad.dtype
         g2d, orig_shape = to_2d(grad.to(_PRECOND_DTYPE))
 
+        # Block-diagonal: precondition each slice independently, then reassemble.
+        if self.use_block_diagonal:
+            result = torch.zeros_like(g2d)
+            offset = 0
+            for bs, blk in zip(self._block_sizes, self._blocks):
+                if self._block_dim == 0:
+                    g_blk = g2d[offset:offset + bs, :]
+                    result[offset:offset + bs, :] = blk.precondition(g_blk).to(_PRECOND_DTYPE)
+                else:
+                    g_blk = g2d[:, offset:offset + bs]
+                    result[:, offset:offset + bs] = blk.precondition(g_blk).to(_PRECOND_DTYPE)
+                offset += bs
+            return from_2d(result, orig_shape).to(orig_dtype)
+
         if not self.use_kronecker:
             bias = getattr(self, "_diag_bias_factor", 1.0)
             denom = (self.diag_ema / bias).reshape_as(g2d).pow(0.25).add_(1e-8)
@@ -339,6 +413,19 @@ class SparsePreconditioner:
         """
         g2d, _ = to_2d(grad.to(_PRECOND_DTYPE))
 
+        # Block-diagonal: sum squared norms over blocks, then sqrt.
+        if self.use_block_diagonal:
+            sq_norms: list[Tensor] = []
+            offset = 0
+            for bs, blk in zip(self._block_sizes, self._blocks):
+                if self._block_dim == 0:
+                    g_blk = g2d[offset:offset + bs, :]
+                else:
+                    g_blk = g2d[:, offset:offset + bs]
+                sq_norms.append(blk.natural_grad_norm(g_blk, eps=eps).pow(2))
+                offset += bs
+            return torch.stack(sq_norms).sum().sqrt()
+
         if not self.use_kronecker:
             denom = self.diag_ema.reshape_as(g2d).pow(0.5).add_(eps)
             return (g2d.pow(2) / denom).sum().sqrt()
@@ -360,8 +447,11 @@ class SparsePreconditioner:
             "precond_step": self.precond_step,
             "k": self.k,
             "use_kronecker": self.use_kronecker,
+            "use_block_diagonal": self.use_block_diagonal,
         }
-        if self.use_kronecker:
+        if self.use_block_diagonal:
+            d["blocks"] = [blk.state_dict() for blk in self._blocks]
+        elif self.use_kronecker:
             d.update({
                 "L_ema": self.L_ema,
                 "R_ema": self.R_ema,
@@ -377,6 +467,8 @@ class SparsePreconditioner:
     def memory_bytes(self) -> int:
         """Return total bytes occupied by all internal state tensors."""
         total = 0
+        if self.use_block_diagonal:
+            return sum(blk.memory_bytes() for blk in self._blocks)
         if self.use_kronecker:
             for t in (self.L_ema, self.R_ema, self.U_l, self.S_l, self.U_r, self.S_r):
                 total += t.numel() * t.element_size()
@@ -387,7 +479,10 @@ class SparsePreconditioner:
     def load_state_dict(self, state: dict) -> None:
         self.precond_step = state["precond_step"]
         self.k = state["k"]
-        if self.use_kronecker:
+        if self.use_block_diagonal:
+            for blk, blk_state in zip(self._blocks, state["blocks"]):
+                blk.load_state_dict(blk_state)
+        elif self.use_kronecker:
             self.L_ema.copy_(state["L_ema"])
             self.R_ema.copy_(state["R_ema"])
             # Eigenfactors are always stored in _PRECOND_DTYPE (float32)

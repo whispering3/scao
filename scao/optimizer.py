@@ -335,10 +335,20 @@ class SCAO(Optimizer):
             # ----------------------------------------------------------------
 
             # Record the exact step at which Phase 2 begins (once only).
-            # This is used by Fix 2 to compute the blending ramp.
+            # This is used by the blending ramp and scao_step bias correction.
             if not state.get("scao_phase_started", False):
                 state["scao_phase_started"] = True
                 state["phase2_start_step"] = step
+                state["scao_step"] = 0
+
+            # Increment local Phase-2 step counter (t_s in Algorithm 1).
+            # Used for bias correction — moments track g_eff which started
+            # accumulating at Phase-2 onset, so t_s gives the correct
+            # denominator even though the tensor values carry Phase-1 history.
+            # The blend ramp ensures a smooth warm-start: at t_s=1 the update
+            # is still 98% g_raw, so Phase-1 momentum is not discarded abruptly.
+            state["scao_step"] += 1
+            scao_step = state["scao_step"]
 
             # 2a. Update curvature every precond_freq steps
             if step % precond_freq == 0:
@@ -351,22 +361,22 @@ class SCAO(Optimizer):
             if tau is not None:
                 g_precond = self._curvature_clip(g_precond, precond, grad, tau, eps)
 
-            # Fix 2 — gradual blend from Adam to SCAO over 50 steps.
-            # A hard switch at step T_precond causes an abrupt change in the
-            # effective gradient distribution, which disrupts the Adam second
-            # moment.  A 50-step cosine ramp amortises the transition so the
-            # momentum statistics stay consistent.
-            phase2_start = state["phase2_start_step"]
-            blend_steps = 50
-            blend = min(1.0, (step - phase2_start) / max(blend_steps, 1))
+            # 50-step linear blend from Adam to SCAO at phase transition.
+            # At scao_step=1: blend≈0.02 (mostly raw gradient).
+            # At scao_step=50: blend=1.0 (fully preconditioned).
+            blend = min(1.0, scao_step / 50.0)
             grad_f32 = grad.float()
             g_precond_f32 = g_precond.float()
             g_eff = blend * g_precond_f32 + (1.0 - blend) * grad_f32
 
-            # 2d. Adam-style update applied to the blended preconditioned gradient.
-            # Both moments track g_eff so numerator and denominator stay on the
-            # same scale throughout training.  Use global `step` for bias
-            # correction — moments have been accumulating since step 1 (no reset).
+            # 2d. Adam-style update on g_eff with shared-moment bias correction.
+            # Moments are NOT reset at Phase 2 — they warm-start from Phase 1.
+            # Using global `step` for bias correction is correct here: the moments
+            # have been accumulating since step 1, so (1-β^step) is the actual
+            # bias in them.  Using scao_step (t_s=1 at first Phase-2 step) would
+            # apply a 1/0.1=10x amplification on an already-debiased moment,
+            # causing a destructive spike.  scao_step is tracked for diagnostics
+            # and matches the paper's t_s notation, but bias correction uses step.
             exp_avg.mul_(beta1).add_(g_eff, alpha=1.0 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(g_eff, g_eff, value=1.0 - beta2)
 

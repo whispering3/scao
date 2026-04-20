@@ -593,3 +593,114 @@ class TestTorchCompile:
 
         for p in model.parameters():
             assert not p.isnan().any()
+
+
+# ---------------------------------------------------------------------------
+# Block-diagonal preconditioning (large-layer path)
+# ---------------------------------------------------------------------------
+
+class TestBlockDiagonal:
+    """Verify block-diagonal preconditioning activates for large matrices."""
+
+    def test_block_diagonal_activates(self):
+        """
+        A parameter with max(m,n) > max_precond_dim should use use_block_diagonal,
+        not the diagonal fallback.
+        """
+        from scao.preconditioner import SparsePreconditioner
+        # 128x16 param, max_precond_dim=64 → split into 2 blocks of 64 rows
+        p = torch.randn(128, 16)
+        prec = SparsePreconditioner(p, max_precond_dim=64)
+        assert prec.use_block_diagonal, "Expected block-diagonal for large param"
+        assert not prec.use_kronecker, "Should not use single Kronecker for large param"
+        assert len(prec._blocks) == 2
+        assert prec._block_dim == 0
+        for blk in prec._blocks:
+            assert blk.use_kronecker, "Each sub-block should use Kronecker"
+
+    def test_block_diagonal_no_nan(self):
+        """Block-diagonal preconditioner must produce finite outputs."""
+        from scao.preconditioner import SparsePreconditioner
+        torch.manual_seed(0)
+        p = torch.randn(128, 16)
+        prec = SparsePreconditioner(p, max_precond_dim=64, k_min=4)
+        g = torch.randn_like(p)
+        prec.update_curvature(g)
+        g_out = prec.precondition(g)
+        assert g_out.shape == g.shape
+        assert not g_out.isnan().any()
+        assert not g_out.isinf().any()
+
+    def test_block_diagonal_state_dict_roundtrip(self):
+        """state_dict / load_state_dict must be invertible for block-diagonal."""
+        from scao.preconditioner import SparsePreconditioner
+        torch.manual_seed(1)
+        p = torch.randn(128, 16)
+        prec = SparsePreconditioner(p, max_precond_dim=64, k_min=4)
+        g = torch.randn_like(p)
+        for _ in range(3):
+            prec.update_curvature(g)
+        g1 = prec.precondition(g).clone()
+
+        state = prec.state_dict()
+        prec2 = SparsePreconditioner(p, max_precond_dim=64, k_min=4)
+        prec2.load_state_dict(state)
+        g2 = prec2.precondition(g)
+        assert torch.allclose(g1, g2, atol=1e-5)
+
+    def test_optimizer_with_large_layer(self):
+        """SCAO optimizer step must work end-to-end on a model with large layers."""
+        model = nn.Linear(256, 64)
+        opt = SCAO(model.parameters(), lr=1e-3, warmup_steps=5, precond_freq=2,
+                   max_precond_dim=64)
+        x = torch.randn(4, 256)
+        for _ in range(15):
+            opt.zero_grad()
+            model(x).sum().backward()
+            opt.step()
+        for p in model.parameters():
+            assert not p.isnan().any()
+            assert not p.isinf().any()
+
+
+# ---------------------------------------------------------------------------
+# Distributed sync (no-op when dist not initialized)
+# ---------------------------------------------------------------------------
+
+class TestDistributed:
+    """Verify distributed utilities are safe in single-process mode."""
+
+    def test_sync_preconditioners_noop_without_dist(self):
+        """sync_preconditioners should be a no-op when dist is not initialized."""
+        from scao.distributed import sync_preconditioners
+        model = nn.Linear(16, 8)
+        opt = SCAO(model.parameters(), lr=1e-3, warmup_steps=0, precond_freq=1)
+        x = torch.randn(4, 16)
+        opt.zero_grad()
+        model(x).sum().backward()
+        opt.step()
+        sync_preconditioners(opt)  # must not raise
+
+    def test_wrap_scao_for_fsdp_returns_optimizer(self):
+        """wrap_scao_for_fsdp must return a callable optimizer."""
+        from scao.distributed import wrap_scao_for_fsdp
+        import warnings
+        model = nn.Linear(16, 8)
+        opt = SCAO(model.parameters(), lr=1e-3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wrapped = wrap_scao_for_fsdp(opt)
+        assert wrapped is not None
+
+    def test_sync_preconditioners_block_diagonal(self):
+        """sync_preconditioners must not crash on block-diagonal preconditioners."""
+        from scao.distributed import sync_preconditioners
+        model = nn.Linear(256, 64)
+        opt = SCAO(model.parameters(), lr=1e-3, warmup_steps=0, precond_freq=1,
+                   max_precond_dim=64)
+        x = torch.randn(4, 256)
+        opt.zero_grad()
+        model(x).sum().backward()
+        opt.step()
+        sync_preconditioners(opt)  # dist not initialized → silent no-op
+

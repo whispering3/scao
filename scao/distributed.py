@@ -64,7 +64,16 @@ def sync_preconditioners(optimizer: "SCAO", process_group=None) -> None:
         if "preconditioner" not in state:
             continue
         prec = state["preconditioner"]
-        if prec.use_kronecker:
+        if getattr(prec, "use_block_diagonal", False):
+            # Block-diagonal: sync each sub-block's eigenfactors
+            for blk in prec._blocks:
+                if blk.use_kronecker:
+                    for t in (blk.U_l, blk.S_l, blk.U_r, blk.S_r,
+                              blk.L_ema, blk.R_ema):
+                        tensors_to_sync.append(t)
+                else:
+                    tensors_to_sync.append(blk.diag_ema)
+        elif prec.use_kronecker:
             # Average eigenfactor matrices across ranks
             for t in (prec.U_l, prec.S_l, prec.U_r, prec.S_r,
                       prec.L_ema, prec.R_ema):
