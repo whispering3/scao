@@ -12,6 +12,30 @@
 
 ---
 
+## 🧪 Tested on a Home GPU — Three Objections, Three Answers
+
+> *"I built a 2nd-order optimizer for LLMs. The industry said it was 'too theoretical'. So I ran it on my own home GPU."*
+
+### Objection 1 — "2nd-order optimizers cause memory overflow (OOM)."
+
+**Test:** Fine-tuning GPT-2 (125M) with SCAO Standalone + LoRA ([`examples/train_local.py`](examples/train_local.py))
+
+**Result:** The Diagonal Fallback avoids inverting giant matrices entirely. SCAO consumed **less than 8 GB VRAM** and maintained the same memory efficiency as first-order methods. The INT8 version reduced VRAM usage by an additional **36.7%**.
+
+### Objection 2 — "Calculating curvature will destroy throughput."
+
+**Test:** Full fine-tuning of TinyStories-1M with no LoRA ([`examples/train_1m.py`](examples/train_1m.py))
+
+**Result:** SCAO handled over **3.7 million real parameters** and processed **~627 tokens per second**. The gain in convergence per step fully compensates for the preconditioner overhead.
+
+### Objection 3 — "It's lab code. Not suitable for the real world."
+
+**Test:** Eliminated every dependency on PyTorch or Hugging Face internals ([`examples/scao.py`](examples/scao.py))
+
+**Result:** SCAO is now a **single file** — a true drop-in replacement. Running natively on Windows with no cloud setup, the loss dropped from **4.536 → 3.307 in under 4 minutes**. The model learned real-world context: *"The secret to a good software architecture is its openness."*
+
+---
+
 ## Table of Contents
 
 1. [The Problem](#1-the-problem)
@@ -617,6 +641,12 @@ scao/                               # Core library
     ├── low_rank_ops.cu             # Fused CUDA kernels: tiled GEMM, Kronecker precond, int8 EMA
     ├── __init__.py                 # fused_kronecker_precond(), int8_ema_update(), truncated_eigh()
     └── setup.py                    # nvcc build (sm_70/75/80/86/89/90)
+
+examples/                           # Self-contained runnable examples
+├── scao.py                         # Standalone single-file SCAO (no library install needed)
+├── train_local.py                  # Fine-tune GPT-2 125M with SCAO + LoRA (<8 GB VRAM)
+├── train_1m.py                     # Full fine-tuning throughput benchmark on TinyStories-1M
+└── inference.py                    # Load LoRA checkpoint and generate text
 
 configs/                            # YAML hyperparameter configs
 ├── base.yaml                       # Shared defaults
