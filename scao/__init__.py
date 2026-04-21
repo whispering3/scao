@@ -31,7 +31,7 @@ from .preconditioner import SparsePreconditioner
 from .utils import matrix_power_neg_quarter, adaptive_rank
 from . import logging as scao_logging
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "SCAO Authors"
 __license__ = "Apache-2.0"
 

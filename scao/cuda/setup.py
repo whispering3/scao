@@ -15,8 +15,12 @@ try:
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
+                    "-gencode=arch=compute_70,code=sm_70",   # V100
+                    "-gencode=arch=compute_75,code=sm_75",   # T4 / RTX 20xx
                     "-gencode=arch=compute_80,code=sm_80",   # A100
-                    "-gencode=arch=compute_89,code=sm_89",   # H100
+                    "-gencode=arch=compute_86,code=sm_86",   # RTX 30xx / A40
+                    "-gencode=arch=compute_89,code=sm_89",   # RTX 40xx / H100
+                    "-gencode=arch=compute_90,code=sm_90",   # H100 SXM
                 ],
             },
         )

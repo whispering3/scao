@@ -42,7 +42,15 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from .utils import adaptive_rank, to_2d, from_2d, low_rank_matrix_power_neg_quarter
+from .utils import (
+    adaptive_rank,
+    to_2d,
+    from_2d,
+    low_rank_matrix_power_neg_quarter,
+    quantize_sym_int8,
+    dequantize_sym_int8,
+)
+from .cuda import fused_kronecker_precond as _cuda_fused_precond
 
 # float32 is the minimum precision required for stable eigendecomposition.
 # bfloat16/float16 are NOT supported by torch.linalg.eigh on CPU.
@@ -72,6 +80,7 @@ class SparsePreconditioner:
         rho: float = 0.999,
         max_precond_dim: int = 4096,
         use_newton_schulz: bool = False,
+        use_int8_ema: bool = False,
     ) -> None:
         shape = param.shape
         device = param.device
@@ -89,6 +98,10 @@ class SparsePreconditioner:
         self.k_max = min(k_max, min(m, n) // 2) if min(m, n) > 2 * k_min else k_min
         self.rho = rho
         self.use_newton_schulz = use_newton_schulz
+        # use_int8_ema: store L_ema/R_ema as int8 tensors with float32 scale factors.
+        # Reduces EMA memory from (m²+n²)*4 bytes to (m²+n²)*1 + 8 bytes — 4× reduction.
+        # Only applied to the Kronecker path (block-diagonal delegates to sub-preconditioners).
+        self.use_int8_ema = use_int8_ema
         self.device = device
         # param_dtype: dtype of the parameter (may be bf16/fp16)
         self.param_dtype = param_dtype
@@ -146,6 +159,7 @@ class SparsePreconditioner:
                     rho=rho,
                     max_precond_dim=max_precond_dim,
                     use_newton_schulz=use_newton_schulz,
+                    use_int8_ema=use_int8_ema,
                 )
                 self._blocks.append(blk)
             # k tracks the average rank across blocks
@@ -168,8 +182,18 @@ class SparsePreconditioner:
             # starting point: eigenvalues begin near 1e-4, S^{-1/4} ≈ 10,
             # which is safely handled by the adaptive-eps regularization.
             _eye_eps = 1e-4
-            self.L_ema = torch.eye(m, device=device, dtype=_PRECOND_DTYPE) * _eye_eps
-            self.R_ema = torch.eye(n, device=device, dtype=_PRECOND_DTYPE) * _eye_eps
+            L_init = torch.eye(m, device=device, dtype=_PRECOND_DTYPE) * _eye_eps
+            R_init = torch.eye(n, device=device, dtype=_PRECOND_DTYPE) * _eye_eps
+
+            if use_int8_ema:
+                # Store EMA as int8 + float scale for 4× memory reduction.
+                # (m²+n²) bytes int8 vs (m²+n²)*4 bytes fp32.
+                self.L_ema_q, self.L_ema_scale = quantize_sym_int8(L_init)
+                self.R_ema_q, self.R_ema_scale = quantize_sym_int8(R_init)
+                # float32 shadow used only during eigendecomposition — not stored between steps
+            else:
+                self.L_ema = L_init
+                self.R_ema = R_init
 
             self.U_l = torch.eye(m, k_init, device=device, dtype=_PRECOND_DTYPE)
             self.S_l = torch.ones(k_init, device=device, dtype=_PRECOND_DTYPE)
@@ -232,8 +256,18 @@ class SparsePreconditioner:
             return
 
         alpha = 1.0 - self.rho
-        self.L_ema.mul_(self.rho).add_(alpha * (g2d_f32 @ g2d_f32.T))
-        self.R_ema.mul_(self.rho).add_(alpha * (g2d_f32.T @ g2d_f32))
+        if self.use_int8_ema:
+            # int8 path: dequantize → update → requantize
+            L_fp32 = dequantize_sym_int8(self.L_ema_q, self.L_ema_scale)
+            L_new  = L_fp32.mul_(self.rho).add_(alpha * (g2d_f32 @ g2d_f32.T))
+            self.L_ema_q, self.L_ema_scale = quantize_sym_int8(L_new)
+
+            R_fp32 = dequantize_sym_int8(self.R_ema_q, self.R_ema_scale)
+            R_new  = R_fp32.mul_(self.rho).add_(alpha * (g2d_f32.T @ g2d_f32))
+            self.R_ema_q, self.R_ema_scale = quantize_sym_int8(R_new)
+        else:
+            self.L_ema.mul_(self.rho).add_(alpha * (g2d_f32 @ g2d_f32.T))
+            self.R_ema.mul_(self.rho).add_(alpha * (g2d_f32.T @ g2d_f32))
 
         # EMA bias correction: the EMA starts at 0 so early estimates are
         # (1-rho^t) * true_value instead of true_value. Divide by (1-rho^t)
@@ -259,9 +293,17 @@ class SparsePreconditioner:
         Decorated with @torch.compiler.disable (try/except + Python loops).
         """
         eps = 1e-8
+        # Dequantize if int8 EMA is active
+        if self.use_int8_ema:
+            L_fp32 = dequantize_sym_int8(self.L_ema_q, self.L_ema_scale)
+            R_fp32 = dequantize_sym_int8(self.R_ema_q, self.R_ema_scale)
+        else:
+            L_fp32 = self.L_ema
+            R_fp32 = self.R_ema
+
         # Apply bias correction so eigenvalues reflect true curvature scale
-        L_debiased = self.L_ema / max(bias_factor, eps)
-        R_debiased = self.R_ema / max(bias_factor, eps)
+        L_debiased = L_fp32 / max(bias_factor, eps)
+        R_debiased = R_fp32 / max(bias_factor, eps)
 
         # Fix 3 — adaptive Tikhonov regularization before inversion.
         # eps_precond = 1e-4 * trace(L) / m ensures the matrix is always
@@ -383,15 +425,10 @@ class SparsePreconditioner:
         _, S_l_inv4 = low_rank_matrix_power_neg_quarter(self.U_l, self.S_l, eps)
         _, S_r_inv4 = low_rank_matrix_power_neg_quarter(self.U_r, self.S_r, eps)
 
-        # Project gradient into the low-rank Kronecker subspace
-        G_proj = (self.U_l.T @ g2d) @ self.U_r   # (k, k)
-
-        # Scale by inverse-quarter eigenvalues (curvature-aware rescaling)
-        G_scaled = S_l_inv4.unsqueeze(1) * G_proj * S_r_inv4.unsqueeze(0)
-
-        # Identity + low-rank correction: complement gets identity preconditioning.
-        # delta = G_scaled - G_proj is the correction applied in the subspace only.
-        G_precond = g2d + self.U_l @ (G_scaled - G_proj) @ self.U_r.T  # (m, n)
+        # Use fused CUDA kernel when available (k ≤ 128) — avoids materialising
+        # the (m,n) correction tensor and reduces memory bandwidth.
+        # Falls back to pure PyTorch (inside _cuda_fused_precond) otherwise.
+        G_precond = _cuda_fused_precond(self.U_l, S_l_inv4, self.U_r, S_r_inv4, g2d)
 
         return from_2d(G_precond, orig_shape).to(orig_dtype)
 
@@ -452,9 +489,19 @@ class SparsePreconditioner:
         if self.use_block_diagonal:
             d["blocks"] = [blk.state_dict() for blk in self._blocks]
         elif self.use_kronecker:
+            if self.use_int8_ema:
+                d.update({
+                    "L_ema_q": self.L_ema_q,
+                    "L_ema_scale": self.L_ema_scale,
+                    "R_ema_q": self.R_ema_q,
+                    "R_ema_scale": self.R_ema_scale,
+                })
+            else:
+                d.update({
+                    "L_ema": self.L_ema,
+                    "R_ema": self.R_ema,
+                })
             d.update({
-                "L_ema": self.L_ema,
-                "R_ema": self.R_ema,
                 "U_l": self.U_l,
                 "S_l": self.S_l,
                 "U_r": self.U_r,
@@ -470,7 +517,14 @@ class SparsePreconditioner:
         if self.use_block_diagonal:
             return sum(blk.memory_bytes() for blk in self._blocks)
         if self.use_kronecker:
-            for t in (self.L_ema, self.R_ema, self.U_l, self.S_l, self.U_r, self.S_r):
+            if self.use_int8_ema:
+                # int8 EMA: 1 byte/element + 4 bytes scale per factor
+                total += self.L_ema_q.numel() + 4  # int8 + scale float
+                total += self.R_ema_q.numel() + 4
+            else:
+                total += self.L_ema.numel() * self.L_ema.element_size()
+                total += self.R_ema.numel() * self.R_ema.element_size()
+            for t in (self.U_l, self.S_l, self.U_r, self.S_r):
                 total += t.numel() * t.element_size()
         else:
             total += self.diag_ema.numel() * self.diag_ema.element_size()
@@ -483,8 +537,14 @@ class SparsePreconditioner:
             for blk, blk_state in zip(self._blocks, state["blocks"]):
                 blk.load_state_dict(blk_state)
         elif self.use_kronecker:
-            self.L_ema.copy_(state["L_ema"])
-            self.R_ema.copy_(state["R_ema"])
+            if self.use_int8_ema:
+                self.L_ema_q = state["L_ema_q"].to(device=self.device, dtype=torch.int8)
+                self.L_ema_scale = float(state["L_ema_scale"])
+                self.R_ema_q = state["R_ema_q"].to(device=self.device, dtype=torch.int8)
+                self.R_ema_scale = float(state["R_ema_scale"])
+            else:
+                self.L_ema.copy_(state["L_ema"])
+                self.R_ema.copy_(state["R_ema"])
             # Eigenfactors are always stored in _PRECOND_DTYPE (float32)
             self.U_l = state["U_l"].to(device=self.device, dtype=_PRECOND_DTYPE)
             self.S_l = state["S_l"].to(device=self.device, dtype=_PRECOND_DTYPE)

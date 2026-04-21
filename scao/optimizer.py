@@ -157,6 +157,7 @@ class SCAO(Optimizer):
         min_precond_updates: int = 10,
         max_precond_dim: int = 4096,
         use_newton_schulz: bool = False,
+        use_int8_ema: bool = False,
         async_precond: bool = True,
     ) -> None:
         if lr < 0:
@@ -187,6 +188,7 @@ class SCAO(Optimizer):
             min_precond_updates=min_precond_updates,
             max_precond_dim=max_precond_dim,
             use_newton_schulz=use_newton_schulz,
+            use_int8_ema=use_int8_ema,
         )
         super().__init__(params, defaults)
 
@@ -230,6 +232,7 @@ class SCAO(Optimizer):
             rho=group["rho"],
             max_precond_dim=group["max_precond_dim"],
             use_newton_schulz=group["use_newton_schulz"],
+            use_int8_ema=group["use_int8_ema"],
         )
 
     # ------------------------------------------------------------------

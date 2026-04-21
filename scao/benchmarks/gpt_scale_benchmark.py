@@ -325,7 +325,7 @@ def run_single(
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=eff_lr, weight_decay=0.1, betas=(0.9, 0.95),
         )
-    elif opt_name == "scao":
+    elif opt_name in ("scao", "scao_int8"):
         # precond_freq: update every ~2% of steps, min 10.
         # Stable eigenvectors (infrequent updates, high rho) outperform fresh-but-noisy
         # estimates (more frequent updates, lower rho) for short training runs.
@@ -350,6 +350,7 @@ def run_single(
             epsilon_sparse=0.01,
             tau=1.0,
             betas=(0.9, 0.95),
+            use_int8_ema=(opt_name == "scao_int8"),
         )
     elif opt_name == "diag_shampoo":
         optimizer = DiagonalShampoo(
@@ -488,7 +489,7 @@ def main() -> None:
                         help="Batch size (0 = auto based on scale)")
     parser.add_argument("--seeds",      type=str,   default="42",
                         help="Comma-separated seeds (default: 42)")
-    parser.add_argument("--optimizers", type=str,   default="adamw,scao,diag_shampoo")
+    parser.add_argument("--optimizers", type=str,   default="adamw,scao,scao_int8")
     parser.add_argument("--lr",         type=float, default=3e-4,
                         help="LR for adamw and scao (default: 3e-4)")
     parser.add_argument("--diag-lr",    type=float, default=1e-3,

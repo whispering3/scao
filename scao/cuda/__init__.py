@@ -11,6 +11,19 @@ To compile the CUDA extension:
 
 Or install from the project root:
     pip install -e ".[cuda]"
+
+Kernels exposed
+---------------
+low_rank_precond_mm(U, s, G, left)
+    2-pass tiled matmul: U diag(s) U^T G.
+    O(k·m·n) vs the old O(k·m²·n) per-element kernel.
+
+fused_kronecker_precond(U_l, s_l_inv4, U_r, s_r_inv4, G)
+    Full identity+correction precond in one GPU launch (k ≤ 128).
+    Avoids materialising the (m,n) correction tensor.
+
+int8_ema_update(ema_q, ema_scale, new_val, rho)
+    Fused dequantize → EMA update → requantize for int8 curvature accumulators.
 """
 
 from __future__ import annotations
@@ -80,6 +93,93 @@ def low_rank_precond_mm(
         proj = proj * s_inv_quarter.unsqueeze(0)
         # (m, n) = (m, k) @ (k, n)^T
         return proj @ U.T
+
+
+# ---------------------------------------------------------------------------
+# Fused both-sides Kronecker precond (identity + correction)
+# G_out = G + U_l @ ((s_l⊗s_r - 1) * (U_l^T@G@U_r)) @ U_r^T
+# ---------------------------------------------------------------------------
+
+def fused_kronecker_precond(
+    U_l: Tensor,
+    s_l_inv4: Tensor,
+    U_r: Tensor,
+    s_r_inv4: Tensor,
+    G: Tensor,
+) -> Tensor:
+    """
+    Full identity+correction Kronecker precond step, fused in one CUDA kernel.
+
+    G_out = G + U_l @ delta @ U_r^T
+    where delta[p,q] = (s_l_inv4[p]*s_r_inv4[q] - 1) * (U_l^T @ G @ U_r)[p,q]
+
+    Falls back to pure PyTorch for k > 128 or when CUDA extension is not
+    compiled.
+
+    Args:
+        U_l:      (m, k) left eigenvectors
+        s_l_inv4: (k,)   left S^{-1/4} factors
+        U_r:      (n, k) right eigenvectors
+        s_r_inv4: (k,)   right S^{-1/4} factors
+        G:        (m, n) gradient matrix (float32 or bfloat16)
+
+    Returns:
+        G_out: (m, n) preconditioned gradient
+    """
+    k = U_l.shape[1]
+    ext = _try_load_cuda_ext()
+    if ext is not None and G.is_cuda and k <= 128:
+        try:
+            return ext.fused_kronecker_precond(U_l, s_l_inv4, U_r, s_r_inv4, G)
+        except (AttributeError, RuntimeError):
+            pass
+
+    # Pure PyTorch fallback: identity + low-rank correction
+    G_proj   = (U_l.T @ G) @ U_r                                          # (k, k)
+    G_scaled = s_l_inv4.unsqueeze(1) * G_proj * s_r_inv4.unsqueeze(0)    # (k, k)
+    return G + U_l @ (G_scaled - G_proj) @ U_r.T                          # (m, n)
+
+
+# ---------------------------------------------------------------------------
+# int8 EMA update (dequantize → rho*old + alpha*new → requantize)
+# ---------------------------------------------------------------------------
+
+def int8_ema_update(
+    ema_q: Tensor,
+    ema_scale: float,
+    new_val: Tensor,
+    rho: float,
+) -> tuple[Tensor, float]:
+    """
+    Fused int8 EMA update on CUDA.
+
+    Computes: ema_new = rho * dequantize(ema_q, ema_scale) + new_val
+    Then requantizes ema_new to int8 and returns (ema_q_new, new_scale).
+
+    Falls back to pure Python when CUDA extension is not compiled.
+
+    Args:
+        ema_q:     (N,) int8 quantized EMA tensor (flat)
+        ema_scale: current dequantization scale (float)
+        new_val:   (N,) float32 new contribution = alpha * outer_product.view(-1)
+        rho:       EMA decay coefficient
+
+    Returns:
+        (ema_q_new, new_scale): updated int8 tensor and its scale
+    """
+    ext = _try_load_cuda_ext()
+    if ext is not None and ema_q.is_cuda and new_val.is_cuda:
+        try:
+            return ext.int8_ema_update(ema_q, ema_scale, new_val, rho)
+        except (AttributeError, RuntimeError):
+            pass
+
+    # Pure Python fallback
+    updated = rho * ema_q.float() * ema_scale + new_val
+    abs_max = updated.abs().max().item()
+    new_scale = abs_max / 127.0 if abs_max > 1e-30 else 1.0
+    q = (updated / new_scale).round().clamp(-127, 127).to(torch.int8)
+    return q, new_scale
 
 
 # ---------------------------------------------------------------------------

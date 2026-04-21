@@ -182,8 +182,46 @@ def spectral_entropy(eigenvalues: Tensor, eps: float = 1e-12) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Gradient reshaping helpers
+# int8 symmetric quantization helpers (for quantized EMA accumulators)
 # ---------------------------------------------------------------------------
+
+def quantize_sym_int8(x: Tensor) -> tuple[Tensor, float]:
+    """
+    Symmetric per-tensor int8 quantization.
+
+    Maps x → (q, scale) such that  x ≈ q.float() * scale,
+    with q ∈ [-127, 127] (int8).  Uses scale = max(|x|) / 127.
+
+    Args:
+        x: float32 tensor of any shape
+
+    Returns:
+        q:     int8 tensor of same shape
+        scale: float, dequantization multiplier
+    """
+    abs_max = x.abs().max().item()
+    if abs_max < 1e-30:
+        return torch.zeros_like(x, dtype=torch.int8), 1.0
+    scale = abs_max / 127.0
+    q = (x / scale).round_().clamp_(-127, 127).to(torch.int8)
+    return q, scale
+
+
+def dequantize_sym_int8(q: Tensor, scale: float) -> Tensor:
+    """
+    Dequantize int8 tensor back to float32.
+
+    Args:
+        q:     int8 tensor
+        scale: dequantization multiplier (from quantize_sym_int8)
+
+    Returns:
+        float32 tensor ≈ original pre-quantization values
+    """
+    return q.to(torch.float32).mul_(scale)
+
+
+
 
 def to_2d(g: Tensor) -> tuple[Tensor, tuple[int, ...]]:
     """
