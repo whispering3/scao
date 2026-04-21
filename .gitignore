@@ -82,3 +82,11 @@ secrets.yml
 *.pem
 *.key
 SCAO_Technical_Paper.docx
+
+# Generated artifacts — not part of the package
+SCAO_Enterprise_Spec.docx
+scao_upload.zip
+scao_project_upload.zip
+report.*.json
+report_125m_350m.txt
+results_curves.csv
