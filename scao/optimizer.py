@@ -72,21 +72,6 @@ class SCAO(Optimizer):
     """
     Sparse Curvature-Aware Adaptive Optimizer.
 
-    Callbacks / monitoring
-    ----------------------
-    Register zero or more callbacks to observe internal metrics at every step::
-
-        from scao.logging import ConsoleLogger
-        opt = SCAO(model.parameters(), lr=1e-3)
-        opt.add_callback(ConsoleLogger(log_every=100))
-
-    Any callable accepting a ``dict`` works (WandB, TensorBoard, custom).
-    Callbacks are only invoked when at least one is registered, so there is
-    zero overhead in the common production case without callbacks.
-    """
-    """
-    Sparse Curvature-Aware Adaptive Optimizer.
-
     Args:
         params:
             Iterable of parameters or parameter groups.
@@ -138,6 +123,18 @@ class SCAO(Optimizer):
             Use a dedicated CUDA stream for preconditioner updates to overlap
             with the main gradient all-reduce (default: True when CUDA is
             available).
+
+    Callbacks / monitoring
+    ----------------------
+    Register zero or more callbacks to observe internal metrics at every step::
+
+        from scao.logging import ConsoleLogger
+        opt = SCAO(model.parameters(), lr=1e-3)
+        opt.add_callback(ConsoleLogger(log_every=100))
+
+    Any callable accepting a ``dict`` works (WandB, TensorBoard, custom).
+    Callbacks are only invoked when at least one is registered, so there is
+    zero overhead in the common production case without callbacks.
     """
 
     def __init__(

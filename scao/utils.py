@@ -13,22 +13,6 @@ from torch import Tensor
 # large matrices; GPU-friendly, no CPU round-trip).
 # ---------------------------------------------------------------------------
 
-_NS_COEFFS_5 = (
-    (3.4445, -4.7750, 2.0315),   # 5-step Zolotarev-optimal (Bernstein 2023)
-)
-_NS_COEFFS_10 = (
-    (1.5, -0.5),
-    (1.5, -0.5),
-    (1.5, -0.5),
-    (1.5, -0.5),
-    (1.5, -0.5),
-    (1.5, -0.5),
-    (1.5, -0.5),
-    (1.5, -0.5),
-    (1.5, -0.5),
-    (1.5, -0.5),
-)
-
 
 def newton_schulz_root_inv(A: Tensor, steps: int = 10, eps: float = 1e-8) -> Tensor:
     """

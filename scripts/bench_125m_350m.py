@@ -78,6 +78,10 @@ def parse_args() -> argparse.Namespace:
                              "Useful for CPU smoke tests, e.g. --seq_len 64")
     parser.add_argument("--csv",     default="results_125m_350m.csv")
     parser.add_argument("--report",  default="report_125m_350m.txt")
+    parser.add_argument(
+        "--out_dir", default="",
+        help="Directory to write CSV and report files (default: current directory)",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +95,15 @@ def _cuda_available() -> bool:
 
 def main() -> None:
     args = parse_args()
+
+    # Resolve output paths: prefix with --out_dir when provided
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not Path(args.csv).is_absolute():
+            args.csv = str(out_dir / args.csv)
+        if not Path(args.report).is_absolute():
+            args.report = str(out_dir / args.report)
 
     scales     = [s.strip() for s in args.scales.split(",")]
     opt_names  = [o.strip() for o in args.optimizers.split(",")]
