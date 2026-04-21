@@ -36,6 +36,26 @@ The hot-path (``precondition()``) is fully traceable.  The curvature update
 (``update_curvature()``) is decorated with ``@torch.compiler.disable`` because
 it runs infrequently and contains non-traceable Python control flow.
 
+DistributedDataParallel (DDP)
+-----------------------------
+SCAO works out-of-the-box with ``torch.nn.parallel.DistributedDataParallel``.
+DDP all-reduces gradients automatically before ``optimizer.step()`` is called,
+so all ranks see identical gradients and optimizer state stays synchronised
+without any extra steps during normal training.
+
+Recommended DDP configuration::
+
+    model = torch.nn.parallel.DistributedDataParallel(model)
+    optimizer = SCAO(model.parameters(), lr=1e-3, async_precond=False)
+
+* Set ``async_precond=False`` to avoid CUDA stream conflicts with NCCL
+  all-reduce operations on the same device.
+
+* After loading a checkpoint on rank 0, broadcast state to all ranks::
+
+    optimizer.load_state_dict(torch.load("ckpt.pt", map_location="cpu"))
+    optimizer.sync_preconditioner()   # broadcast from rank 0 → all ranks
+
 Usage
 -----
     from scao import SCAO
@@ -65,7 +85,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from .preconditioner import SparsePreconditioner
+from .preconditioner import SparsePreconditioner, _broadcast_precond
 
 
 class SCAO(Optimizer):
@@ -443,8 +463,63 @@ class SCAO(Optimizer):
             self._precond_stream.synchronize()
 
     # ------------------------------------------------------------------
-    # Callback registration
+    # Distributed: sync preconditioner state across ranks
     # ------------------------------------------------------------------
+
+    def sync_preconditioner(
+        self,
+        process_group: "torch.distributed.ProcessGroup | None" = None,
+    ) -> None:
+        """
+        Broadcast all optimizer state from rank 0 to every other rank.
+
+        Call this after loading a checkpoint on rank 0 before resuming
+        distributed training, or any time you suspect optimizer state may
+        have diverged across ranks (e.g. after a rank restart).
+
+        During normal DDP training you do **not** need to call this — DDP
+        all-reduces gradients before ``step()`` so all ranks receive identical
+        updates and state stays in sync automatically.
+
+        Args:
+            process_group: the process group to use for collective operations.
+                           Defaults to the global default group.
+
+        Example::
+
+            # After loading checkpoint on rank 0:
+            if dist.get_rank() == 0:
+                optimizer.load_state_dict(torch.load("ckpt.pt"))
+            optimizer.sync_preconditioner()
+        """
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            warnings.warn(
+                "sync_preconditioner() called but torch.distributed is not initialised. "
+                "Call torch.distributed.init_process_group() first.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+
+        for state in self.state.values():
+            # Sync first- and second-moment tensors.
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key in state:
+                    dist.broadcast(state[key], src=0, group=process_group)
+
+            # Sync per-step counter.
+            if "step" in state:
+                step_t = torch.tensor([state["step"]], dtype=torch.int64)
+                dist.broadcast(step_t, src=0, group=process_group)
+                state["step"] = int(step_t.item())
+
+            # Sync preconditioner tensors (eigenfactors, EMA accumulators).
+            precond: SparsePreconditioner | None = state.get("preconditioner")
+            if precond is not None:
+                _broadcast_precond(precond, process_group)
+
 
     def add_callback(self, callback) -> None:
         """

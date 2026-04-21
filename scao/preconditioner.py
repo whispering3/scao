@@ -552,3 +552,75 @@ class SparsePreconditioner:
             self.S_r = state["S_r"].to(device=self.device, dtype=_PRECOND_DTYPE)
         else:
             self.diag_ema.copy_(state["diag_ema"])
+
+
+def _broadcast_precond(
+    precond: "SparsePreconditioner",
+    process_group: "torch.distributed.ProcessGroup | None" = None,
+) -> None:
+    """
+    Broadcast all preconditioner state tensors from rank 0 to all ranks.
+
+    Handles all three preconditioner modes (Kronecker, block-diagonal, diagonal)
+    and both EMA storage formats (float32 and int8).  Also syncs the step counter
+    and adaptive rank ``k`` so that subsequent updates remain numerically identical
+    across all ranks.
+
+    Args:
+        precond: the SparsePreconditioner instance to synchronise.
+        process_group: optional process group (default: the global default group).
+
+    Notes:
+        This function is called by ``SCAO.sync_preconditioner()``.  It is not
+        intended to be called directly unless you manage the distributed state
+        yourself.
+    """
+    import torch.distributed as dist
+
+    # Sync step counter from rank 0.
+    step_t = torch.tensor([precond.precond_step], dtype=torch.int64, device=precond.device)
+    dist.broadcast(step_t, src=0, group=process_group)
+    precond.precond_step = int(step_t.item())
+
+    if precond.use_block_diagonal:
+        for blk in precond._blocks:
+            _broadcast_precond(blk, process_group)
+        return
+
+    if precond.use_kronecker:
+        # Sync the adaptive rank k; non-rank-0 processes must resize tensors if
+        # the checkpoint was saved at a different rank than their current state.
+        k_t = torch.tensor([precond.k], dtype=torch.int64, device=precond.device)
+        dist.broadcast(k_t, src=0, group=process_group)
+        k_new = int(k_t.item())
+
+        if k_new != precond.k:
+            precond.k = k_new
+            precond.U_l = torch.empty(precond.m, k_new, dtype=_PRECOND_DTYPE, device=precond.device)
+            precond.S_l = torch.empty(k_new, dtype=_PRECOND_DTYPE, device=precond.device)
+            precond.U_r = torch.empty(precond.n, k_new, dtype=_PRECOND_DTYPE, device=precond.device)
+            precond.S_r = torch.empty(k_new, dtype=_PRECOND_DTYPE, device=precond.device)
+
+        # Broadcast EMA accumulators.
+        if precond.use_int8_ema:
+            dist.broadcast(precond.L_ema_q, src=0, group=process_group)
+            dist.broadcast(precond.R_ema_q, src=0, group=process_group)
+            # Scale factors are Python floats; wrap as tensors for broadcast.
+            for attr in ("L_ema_scale", "R_ema_scale"):
+                t = torch.tensor([getattr(precond, attr)], device=precond.device)
+                dist.broadcast(t, src=0, group=process_group)
+                setattr(precond, attr, float(t.item()))
+        else:
+            dist.broadcast(precond.L_ema, src=0, group=process_group)
+            dist.broadcast(precond.R_ema, src=0, group=process_group)
+
+        # Broadcast eigenfactors (in-place: tensors already have the right shape).
+        dist.broadcast(precond.U_l, src=0, group=process_group)
+        dist.broadcast(precond.S_l, src=0, group=process_group)
+        dist.broadcast(precond.U_r, src=0, group=process_group)
+        dist.broadcast(precond.S_r, src=0, group=process_group)
+
+    else:
+        # Diagonal fallback
+        dist.broadcast(precond.diag_ema, src=0, group=process_group)
+

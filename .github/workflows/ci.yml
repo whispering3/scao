@@ -37,7 +37,10 @@ jobs:
         run: mypy scao/ --ignore-missing-imports --exclude 'scao/(benchmarks|tests|cuda)' || true
 
       - name: Run tests
-        run: pytest scao/tests/ -v --tb=short --cov=scao --cov-report=xml --ignore=scao/tests/test_profiling.py
+        run: pytest scao/tests/ -v --tb=short --cov=scao --cov-report=xml --ignore=scao/tests/test_profiling.py --ignore=scao/tests/test_ddp.py
+
+      - name: DDP tests (gloo / CPU, 2 processes)
+        run: pytest scao/tests/test_ddp.py -v --tb=short
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
