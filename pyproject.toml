@@ -66,7 +66,7 @@ all = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["scao*"]
-exclude = ["scao/tests*", "scao/benchmarks*", "scao/cuda*"]
+exclude = ["scao/tests*", "scao/benchmarks*"]
 
 [tool.setuptools.package-data]
 scao = ["py.typed"]

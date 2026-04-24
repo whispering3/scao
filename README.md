@@ -8,7 +8,17 @@
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0%2B-orange)](https://pytorch.org)
 
 > **A second-order PyTorch optimizer that delivers Shampoo-quality preconditioned gradients at near-AdamW memory and throughput cost.**  
-> Drop-in replacement for `AdamW`. One-line change. Real gains.
+> Drop-in replacement for `AdamW`. One-line change. Real gains.  
+> **Now available on PyPI:** `pip install scao`
+
+---
+
+## 🚀 Support the Research
+
+If you have endorsement rights on arXiv for **cs.LG** (Machine Learning), please consider endorsing our paper to help us share this work with the community:
+
+👉 **[Endorse SCAO on arXiv](https://arxiv.org/auth/endorse?x=X3VJ88)**
+
 
 ---
 
@@ -30,14 +40,15 @@
 
 ### Objection 3 — "It's lab code. Not suitable for the real world."
 
-**Test:** Eliminated every dependency on PyTorch or Hugging Face internals ([`examples/scao.py`](examples/scao.py))
+**Test:** SCAO is now a professional Python package, installable via PyPI ([`pip install scao`](https://pypi.org/project/scao/)).
 
-**Result:** SCAO is now a **single file** — a true drop-in replacement. Running natively on Windows with no cloud setup, the loss dropped from **4.536 → 3.307 in under 4 minutes**. The model learned real-world context: *"The secret to a good software architecture is its openness."*
+**Result:** SCAO has moved from a research script to a production-ready package. It's a true drop-in replacement for AdamW. Running natively on Windows with no cloud setup, the loss dropped from **4.536 → 3.307 in under 4 minutes**. The model learned real-world context: *"The secret to a good software architecture is its openness."*
 
 ---
 
 ## Table of Contents
 
+- [🚀 Support the Research](#-support-the-research)
 1. [The Problem](#1-the-problem)
 2. [SCAO's Solution](#2-scaos-solution)
 3. [Algorithm](#3-algorithm)
@@ -643,7 +654,6 @@ scao/                               # Core library
     └── setup.py                    # nvcc build (sm_70/75/80/86/89/90)
 
 examples/                           # Self-contained runnable examples
-├── scao.py                         # Standalone single-file SCAO (no library install needed)
 ├── train_local.py                  # Fine-tune GPT-2 125M with SCAO + LoRA (<8 GB VRAM)
 ├── train_1m.py                     # Full fine-tuning throughput benchmark on TinyStories-1M
 └── inference.py                    # Load LoRA checkpoint and generate text

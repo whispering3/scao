@@ -3,10 +3,13 @@ include README.md
 include CHANGELOG.md
 include pyproject.toml
 
-recursive-include scao *.py
+recursive-include scao *.py *.cu *.h
 recursive-include configs *.yaml
 exclude scao/benchmarks/*.py
 exclude scao/tests/*.py
 exclude scripts/*
 exclude paper/*
 exclude results_*.csv
+exclude report_*.txt
+exclude *.csv
+
