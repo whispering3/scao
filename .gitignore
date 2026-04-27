@@ -73,8 +73,8 @@ wandb/
 # Paper (not distributed with package)
 paper/
 
-# Large result CSVs (keep in repo for reproducibility, but exclude from sdist)
-# results_*.csv is included deliberately — do not add here
+# Result CSVs live in results/ — root-level ones are legacy artifacts
+results_*.csv
 
 # Secrets
 .env.local
