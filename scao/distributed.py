@@ -35,6 +35,28 @@ if TYPE_CHECKING:
     from .optimizer import SCAO
 
 
+def _collect_kronecker_tensors(
+    prec,
+    tensors_to_sync: list[torch.Tensor],
+    int8_ema_precs: list,
+) -> None:
+    """
+    Collect tensors from a single Kronecker preconditioner for distributed sync.
+
+    Eigenfactors (U_l, S_l, U_r, S_r) are always float32 and added to
+    ``tensors_to_sync`` for standard all-reduce.  EMA accumulators are
+    routed to ``tensors_to_sync`` (fp32 path) or ``int8_ema_precs``
+    (int8 path, requires dequantize → reduce → requantize).
+    """
+    for t in (prec.U_l, prec.S_l, prec.U_r, prec.S_r):
+        tensors_to_sync.append(t)
+    if getattr(prec, "use_int8_ema", False):
+        int8_ema_precs.append((prec, "L"))
+        int8_ema_precs.append((prec, "R"))
+    else:
+        tensors_to_sync.extend([prec.L_ema, prec.R_ema])
+
+
 def sync_preconditioners(optimizer: "SCAO", process_group=None) -> None:
     """
     All-reduce preconditioner eigenfactors across all ranks.
@@ -45,6 +67,10 @@ def sync_preconditioners(optimizer: "SCAO", process_group=None) -> None:
 
     Call this AFTER optimizer.step() and BEFORE the next forward pass, or
     better: schedule it on the preconditioner update cadence (precond_freq).
+
+    Supports both fp32 and int8 EMA accumulators (``use_int8_ema=True``).
+    Int8 tensors are dequantized to float32 before the all-reduce, then
+    re-quantized on each rank after averaging.
 
     Args:
         optimizer:  SCAO optimizer instance.
@@ -57,31 +83,29 @@ def sync_preconditioners(optimizer: "SCAO", process_group=None) -> None:
     if world_size == 1:
         return
 
+    from .utils import dequantize_sym_int8, quantize_sym_int8
+
     handles = []
     tensors_to_sync: list[torch.Tensor] = []
+    int8_ema_precs: list = []  # list of (prec, "L"|"R") for int8 EMA path
 
     for state in optimizer.state.values():
         if "preconditioner" not in state:
             continue
         prec = state["preconditioner"]
         if getattr(prec, "use_block_diagonal", False):
-            # Block-diagonal: sync each sub-block's eigenfactors
+            # Block-diagonal: sync each sub-block independently
             for blk in prec._blocks:
                 if blk.use_kronecker:
-                    for t in (blk.U_l, blk.S_l, blk.U_r, blk.S_r,
-                              blk.L_ema, blk.R_ema):
-                        tensors_to_sync.append(t)
+                    _collect_kronecker_tensors(blk, tensors_to_sync, int8_ema_precs)
                 else:
                     tensors_to_sync.append(blk.diag_ema)
         elif prec.use_kronecker:
-            # Average eigenfactor matrices across ranks
-            for t in (prec.U_l, prec.S_l, prec.U_r, prec.S_r,
-                      prec.L_ema, prec.R_ema):
-                tensors_to_sync.append(t)
+            _collect_kronecker_tensors(prec, tensors_to_sync, int8_ema_precs)
         else:
             tensors_to_sync.append(prec.diag_ema)
 
-    # Batch all-reduce into as few calls as possible
+    # Batch all-reduce of float32 tensors (eigenfactors + non-int8 EMAs)
     for t in tensors_to_sync:
         h = dist.all_reduce(t, op=dist.ReduceOp.SUM, group=process_group, async_op=True)
         handles.append((h, t))
@@ -89,6 +113,19 @@ def sync_preconditioners(optimizer: "SCAO", process_group=None) -> None:
     for h, t in handles:
         h.wait()
         t.div_(world_size)
+
+    # All-reduce int8 EMA accumulators: dequantize → reduce → average → requantize
+    for prec, side in int8_ema_precs:
+        if side == "L":
+            ema_f32 = dequantize_sym_int8(prec.L_ema_q, prec.L_ema_scale)
+            dist.all_reduce(ema_f32, op=dist.ReduceOp.SUM, group=process_group)
+            ema_f32.div_(world_size)
+            prec.L_ema_q, prec.L_ema_scale = quantize_sym_int8(ema_f32)
+        else:
+            ema_f32 = dequantize_sym_int8(prec.R_ema_q, prec.R_ema_scale)
+            dist.all_reduce(ema_f32, op=dist.ReduceOp.SUM, group=process_group)
+            ema_f32.div_(world_size)
+            prec.R_ema_q, prec.R_ema_scale = quantize_sym_int8(ema_f32)
 
 
 def wrap_scao_for_fsdp(optimizer: "SCAO") -> "SCAO":

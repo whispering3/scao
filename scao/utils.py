@@ -32,24 +32,26 @@ def newton_schulz_root_inv(A: Tensor, steps: int = 10, eps: float = 1e-8) -> Ten
     # Normalise: X0 = A / ||A||_F so that spectral radius ≈ 1
     norm = A.norm(p="fro").clamp(min=eps)
     X = A / norm
-    Y = torch.eye(m, dtype=dtype, device=device)
+    # Allocate identity once and reuse across both Newton-Schulz loops.
+    eye = torch.eye(m, dtype=dtype, device=device)
+    Y = eye.clone()
 
     for _ in range(steps):
         # Coupled iterations: X_{k+1} = (3*X - X*Y*X) / 2
         #                      Y_{k+1} = (3*I - Y*X) * Y / 2
         XY = X @ Y
         X_new = (3.0 * X - XY @ X) * 0.5
-        Y_new = (3.0 * torch.eye(m, dtype=dtype, device=device) - XY) @ Y * 0.5
+        Y_new = (3.0 * eye - XY) @ Y * 0.5
         X, Y = X_new, Y_new
 
     # X ≈ A^{-1/2}; we need A^{-1/4} = (A^{-1/2})^{1/2}
     # One more iteration with Y = I and X = result
     X2 = X
-    Y2 = torch.eye(m, dtype=dtype, device=device)
+    Y2 = eye.clone()
     for _ in range(steps):
         X2Y2 = X2 @ Y2
         X2 = (3.0 * X2 - X2Y2 @ X2) * 0.5
-        Y2 = (3.0 * torch.eye(m, dtype=dtype, device=device) - X2Y2) @ Y2 * 0.5
+        Y2 = (3.0 * eye - X2Y2) @ Y2 * 0.5
 
     # Scale back: (A/||A||)^{-1/4} = ||A||^{1/4} * A^{-1/4}
     scale = norm.pow(0.25)

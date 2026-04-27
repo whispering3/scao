@@ -91,6 +91,9 @@ report.*.json
 report_125m_350m.txt
 results_curves.csv
 
+# Unpacked dist/sdist directories (e.g. scao-0.1.1/)
+scao-*/
+
 # Examples — local training outputs (checkpoints, LoRA weights, model files)
 examples/resultado_scao_1m/
 examples/resultado_scao_local/
