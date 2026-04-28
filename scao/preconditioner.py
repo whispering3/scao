@@ -36,6 +36,18 @@ infrequently (every T_precond steps) so graph-breaks there are harmless.
 
 ``precondition()`` and ``natural_grad_norm()`` contain only tensor ops and are
 compile-friendly when invoked from a ``torch.compile``-d training step.
+
+Changelog
+---------
+v3 patch:
+  - R5 support: ``k`` is now a property with a setter that safely truncates
+    U_l, S_l, U_r, S_r when SCAO._maybe_adjust_rank() assigns a new rank
+    externally between eigenfactor updates.  Without this, an external
+    ``precond.k = new_k`` would leave the eigenfactor shapes stale, causing
+    a shape mismatch in ``precondition()``.
+  - Internal storage uses ``_k`` to avoid recursion in ``__init__``.
+  - Block-diagonal mode propagates external rank changes to sub-blocks
+    and recomputes the average k.
 """
 
 from __future__ import annotations
@@ -68,7 +80,18 @@ class SparsePreconditioner:
         S_l       : (k,)   - left eigenvalues (descending)
         U_r       : (n, k) - right eigenvectors
         S_r       : (k,)   - right eigenvalues (descending)
-        k         : current rank (int)
+        k         : current rank (int, property — assignment triggers safe resize)
+
+    v3 note on ``k``
+    ----------------
+    ``k`` is now a property.  Assigning ``precond.k = new_k`` (as done by
+    SCAO._maybe_adjust_rank for R5) will:
+      1. Clamp new_k to [k_min, k_max].
+      2. Truncate U_l/S_l/U_r/S_r to the new rank (no-op if rank grows —
+         the next eigenfactor update will expand them correctly).
+      3. Update the internal ``_k`` counter.
+    This prevents shape mismatches in ``precondition()`` when the external
+    rank assignment happens between eigenfactor updates.
     """
 
     def __init__(
@@ -94,8 +117,12 @@ class SparsePreconditioner:
         self.m = m
         self.n = n
         self.epsilon_sparse = epsilon_sparse
-        self.k_min = k_min
-        self.k_max = min(k_max, min(m, n) // 2) if min(m, n) > 2 * k_min else k_min
+
+        # Clamp k_min/k_max to matrix dimensions to avoid invalid ranks in small layers
+        d_min = min(m, n)
+        self.k_min = min(k_min, d_min)
+        self.k_max = min(k_max, d_min // 2) if d_min > 2 * self.k_min else self.k_min
+        
         self.rho = rho
         self.use_newton_schulz = use_newton_schulz
         # use_int8_ema: store L_ema/R_ema as int8 tensors with float32 scale factors.
@@ -162,12 +189,15 @@ class SparsePreconditioner:
                     use_int8_ema=use_int8_ema,
                 )
                 self._blocks.append(blk)
-            # k tracks the average rank across blocks
-            self.k: int = self._blocks[0].k if self._blocks else k_min
+            # _k tracks the average rank across blocks.
+            # Use _k directly to bypass the property setter (no eigenfactors here).
+            self._k: int = self._blocks[0]._k if self._blocks else k_min
 
         elif self.use_kronecker:
             k_init = min(k_min, min(m, n))
-            self.k: int = k_init
+            # Use _k directly in __init__ to avoid triggering the property setter
+            # before U_l/S_l/U_r/S_r are initialised.
+            self._k = k_init
 
             # Curvature EMAs and eigenfactors are ALWAYS stored in float32.
             # This is required because linalg.eigh is not implemented for
@@ -203,10 +233,62 @@ class SparsePreconditioner:
             # Diagonal fallback: maintain per-element variance estimate in float32
             self.diag_ema = torch.zeros(shape, device=device, dtype=_PRECOND_DTYPE)
             self._diag_bias_factor: float = 1e-8  # updated in update_curvature
-            self.k = 1
+            self._k = 1
 
         # Step counter for this preconditioner (updated externally)
         self.precond_step: int = 0
+
+    # ------------------------------------------------------------------
+    # R5: k property — safe external rank assignment
+    # ------------------------------------------------------------------
+
+    @property
+    def k(self) -> int:
+        """Current preconditioner rank."""
+        return self._k
+
+    @k.setter
+    def k(self, new_k: int) -> None:
+        """
+        Assign a new rank, clamping to [k_min, k_max] and truncating
+        eigenfactor tensors if the rank decreases.
+
+        Called by SCAO._maybe_adjust_rank() (R5).  Safe to call between
+        eigenfactor updates: truncation keeps U/S consistent so that
+        ``precondition()`` never sees a shape mismatch.
+
+        If new_k > current k, eigenfactors are NOT expanded here — they
+        will be expanded to the correct size on the next
+        ``_update_eigenfactors()`` call, which recomputes U/S from scratch.
+        The interim mismatch (k says N but tensors have M < N columns) is
+        handled by clamping new_k to the current tensor width until the
+        next eigenfactor update.
+        """
+        new_k = int(min(self.k_max, max(self.k_min, new_k)))
+
+        if self.use_block_diagonal:
+            # Propagate to sub-blocks and recompute average rank.
+            for blk in self._blocks:
+                blk.k = new_k
+            self._k = sum(b._k for b in self._blocks) // max(len(self._blocks), 1)
+            return
+
+        if self.use_kronecker:
+            if new_k < self._k:
+                # Truncate eigenfactors to the smaller rank immediately so
+                # precondition() stays consistent until the next eigh call.
+                self.U_l = self.U_l[:, :new_k].contiguous()
+                self.S_l = self.S_l[:new_k].contiguous()
+                self.U_r = self.U_r[:, :new_k].contiguous()
+                self.S_r = self.S_r[:new_k].contiguous()
+            elif new_k > self._k:
+                # Rank increase: clamp to the current tensor width.
+                # _update_eigenfactors will expand to new_k on the next update.
+                actual_cols = self.U_l.shape[1]
+                new_k = min(new_k, actual_cols) if new_k > actual_cols else new_k
+                # If tensors are already wider (shouldn't happen normally), just accept.
+
+        self._k = new_k
 
     # ------------------------------------------------------------------
     # Curvature accumulation (called every T_precond optimizer steps)
@@ -243,7 +325,8 @@ class SparsePreconditioner:
                     g_blk = g2d_f32[:, offset:offset + bs]
                 blk.update_curvature(g_blk)
                 offset += bs
-            self.k = sum(b.k for b in self._blocks) // len(self._blocks)
+            # Recompute average rank across blocks after their eigenfactor updates.
+            self._k = sum(b._k for b in self._blocks) // max(len(self._blocks), 1)
             return
 
         if not self.use_kronecker:
@@ -291,6 +374,9 @@ class SparsePreconditioner:
 
         All computations are in float32 (_PRECOND_DTYPE).
         Decorated with @torch.compiler.disable (try/except + Python loops).
+
+        v3 note: ``_k`` is assigned directly here (bypassing the property setter)
+        because U/S tensors are being replaced in full — no truncation needed.
         """
         eps = 1e-8
         # Dequantize if int8 EMA is active
@@ -351,10 +437,13 @@ class SparsePreconditioner:
         # Take the smaller of the two to keep Kronecker structure symmetric
         k_new = min(k_l, k_r)
         # Apply momentum on rank change: avoid oscillating between ranks
-        k_new = max(k_new, self.k - 1)   # allow rank to drop by at most 1 per update
-        k_new = min(k_new, self.k + 4)   # allow rank to grow by at most 4 per update
+        k_new = max(k_new, self._k - 1)   # allow rank to drop by at most 1 per update
+        k_new = min(k_new, self._k + 4)   # allow rank to grow by at most 4 per update
         k_new = int(min(self.k_max, max(self.k_min, k_new)))
-        self.k = k_new
+
+        # Assign _k directly: U/S tensors are being replaced in full below,
+        # so the property setter's truncation logic is not needed here.
+        self._k = k_new
 
         # Store truncated eigenfactors
         self.U_l = U_l_full[:, :k_new].contiguous()
@@ -482,7 +571,7 @@ class SparsePreconditioner:
     def state_dict(self) -> dict:
         d: dict = {
             "precond_step": self.precond_step,
-            "k": self.k,
+            "k": self._k,  # use _k directly to avoid setter side-effects
             "use_kronecker": self.use_kronecker,
             "use_block_diagonal": self.use_block_diagonal,
         }
@@ -532,7 +621,9 @@ class SparsePreconditioner:
 
     def load_state_dict(self, state: dict) -> None:
         self.precond_step = state["precond_step"]
-        self.k = state["k"]
+        # Assign _k directly to avoid the setter's truncation logic during load;
+        # eigenfactors are restored to exactly the saved shape below.
+        self._k = state["k"]
         if self.use_block_diagonal:
             for blk, blk_state in zip(self._blocks, state["blocks"]):
                 blk.load_state_dict(blk_state)
@@ -585,17 +676,21 @@ def _broadcast_precond(
     if precond.use_block_diagonal:
         for blk in precond._blocks:
             _broadcast_precond(blk, process_group)
+        # Recompute average rank after sub-blocks are synced.
+        precond._k = sum(b._k for b in precond._blocks) // max(len(precond._blocks), 1)
         return
 
     if precond.use_kronecker:
         # Sync the adaptive rank k; non-rank-0 processes must resize tensors if
         # the checkpoint was saved at a different rank than their current state.
-        k_t = torch.tensor([precond.k], dtype=torch.int64, device=precond.device)
+        k_t = torch.tensor([precond._k], dtype=torch.int64, device=precond.device)
         dist.broadcast(k_t, src=0, group=process_group)
         k_new = int(k_t.item())
 
-        if k_new != precond.k:
-            precond.k = k_new
+        if k_new != precond._k:
+            # Use _k directly: we're about to replace the tensors in full,
+            # so the setter's truncation logic is not appropriate here.
+            precond._k = k_new
             precond.U_l = torch.empty(precond.m, k_new, dtype=_PRECOND_DTYPE, device=precond.device)
             precond.S_l = torch.empty(k_new, dtype=_PRECOND_DTYPE, device=precond.device)
             precond.U_r = torch.empty(precond.n, k_new, dtype=_PRECOND_DTYPE, device=precond.device)
@@ -623,4 +718,3 @@ def _broadcast_precond(
     else:
         # Diagonal fallback
         dist.broadcast(precond.diag_ema, src=0, group=process_group)
-
