@@ -144,13 +144,9 @@ def adaptive_rank(
         return k_min
 
     threshold = (1.0 - epsilon) * total
-    cumsum = 0.0
-    for k, v in enumerate(eigenvalues.tolist(), start=1):
-        cumsum += v
-        if cumsum >= threshold:
-            break
-    else:
-        k = len(eigenvalues)
+    cumsum = torch.cumsum(eigenvalues, dim=0)
+    indices = (cumsum >= threshold).nonzero(as_tuple=True)[0]
+    k = int(indices[0].item()) + 1 if indices.numel() > 0 else len(eigenvalues)
 
     return int(min(k_max, max(k_min, k)))
 

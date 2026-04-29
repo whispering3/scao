@@ -5,6 +5,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.0] — 2026-04-28
+
+### Added (SCAO v2)
+- **Adaptive Warmup (R1)**: Event-driven exit from Phase 1 (Adam) to Phase 2 (Kronecker) based on gradient stability, saving up to 30% of training time.
+- **Dynamic Sparsity (R2)**: Per-layer mask thresholds scaled by gradient energy to curvature ratio; preserves rank in embedding/attention layers while compressing MLPs.
+- **Lazy Preconditioning (R3)**: Event-driven factor updates (cosine-similarity trigger) to maintain throughput on H100/A100 clusters.
+- **gSNR Clipping (R4)**: Element-wise signal-to-noise ratio masks applied before updates to stabilize Foundation Model training.
+- **Adaptive Rank (R5)**: Dynamic `k` selection proportional to layer activity and spectral mass.
+- **Scale Presets**: New optimized configurations: `scao_3b`, `scao_7b`, `scao_40b`, and `scao_125b`.
+- **Int8 EMA (Stable)**: Production-ready 4x reduction in curvature buffer memory with zero convergence loss.
+- **Asynchronous Preconditioning**: Background CUDA compute for factor updates to hide second-order overhead.
+
+### Fixed
+- **BFloat16 Robustness**: Enhanced numerical stability via float32 accumulation for all curvature statistics.
+- **Memory Optimization**: Fixed VRAM spikes in block-diagonal preconditioning for massive (1024+) layers.
+- **T4 Stability**: Validated 3B-parameter training on 16GB T4 GPUs (QLoRA).
+
+---
+
+
 ## [0.1.0] — 2026-04-20
 
 ### Initial open-source release

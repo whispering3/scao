@@ -269,6 +269,7 @@ class SCAO(Optimizer):
         rho: float = 0.999,
         tau: float | None = 1.0,
         warmup_steps: int = 100,
+        blend_steps: int = 50,
         min_precond_updates: int = 10,
         max_precond_dim: int = 4096,
         use_newton_schulz: bool = False,
@@ -281,9 +282,9 @@ class SCAO(Optimizer):
         lars_coeff: float = 1e-3,
         lookahead_k: int = 5,
         lookahead_alpha: float = 0.5,
-        # v3
-        dynamic_sparsity: bool = True,
-        adaptive_warmup: bool = True,
+        # v3 (Disabled by default to match v2 memory footprint)
+        dynamic_sparsity: bool = False,
+        adaptive_warmup: bool = False,
         warmup_stability_threshold: float = 0.05,
         warmup_patience: int = 5,
         lazy_precond: bool = False,
@@ -306,7 +307,8 @@ class SCAO(Optimizer):
             lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
             precond_freq=precond_freq, epsilon_sparse=epsilon_sparse,
             k_min=k_min, k_max=k_max, rho=rho, tau=tau,
-            warmup_steps=warmup_steps, min_precond_updates=min_precond_updates,
+            warmup_steps=warmup_steps, blend_steps=blend_steps,
+            min_precond_updates=min_precond_updates,
             max_precond_dim=max_precond_dim, use_newton_schulz=use_newton_schulz,
             use_int8_ema=use_int8_ema, beta3=beta3, lars_coeff=lars_coeff,
         )
@@ -468,11 +470,16 @@ class SCAO(Optimizer):
         # Calling update() per-parameter would corrupt _stable_count by incrementing
         # it N times per step (N = number of parameters) instead of once per step.
         if self._adaptive_warmup:
-            self._in_warmup_global: bool = self._warmup_scheduler.update(
+            self._in_warmup_global = self._warmup_scheduler.update(
                 self._global_step, avg_norm
             )
         else:
-            self._in_warmup_global = True  # will be overridden per-param by step counter
+            # Per-param warmup is determined by `step <= warmup_steps` in _step_group.
+            # Set the global flag to a correct proxy for logging (warmup_active metric).
+            warmup_steps_max = max(
+                (g.get("warmup_steps", 100) for g in self.param_groups), default=100
+            )
+            self._in_warmup_global = self._global_step <= warmup_steps_max
 
         for group in self.param_groups:
             self._step_group(group, avg_norm)
@@ -599,9 +606,10 @@ class SCAO(Optimizer):
             if tau is not None:
                 g_precond = self._curvature_clip(g_precond, precond, p.grad, tau, eps)
 
-            # Linear blend from raw gradient to preconditioned over 50 steps,
+            # Linear blend from raw gradient to preconditioned over blend_steps,
             # preventing a cold-start spike at the Phase 1→2 transition
-            blend = min(1.0, scao_step / 50.0)
+            blend_steps = group.get("blend_steps", 50)
+            blend = min(1.0, scao_step / blend_steps) if blend_steps > 0 else 1.0
             g_eff = blend * g_precond.float() + (1.0 - blend) * grad
 
             # Adan: three-term momentum with gradient delta
@@ -612,11 +620,6 @@ class SCAO(Optimizer):
             exp_avg_diff.mul_(beta3).add_(grad_delta, alpha=1.0 - beta3)
             g_adan = g_eff + (1.0 - beta3) * grad_delta
             exp_avg_sq.mul_(beta2).addcmul_(g_adan, g_adan, value=1.0 - beta2)
-
-            # R4: element-wise SNR mask after moments are updated so the mask
-            # reflects current signal quality, not a cold initialisation
-            if self._use_gsnr_clip:
-                g_eff = _gsnr_clip(g_eff, exp_avg, exp_avg_sq, eps, self._gsnr_threshold)
 
             # Bias correction uses global step, not scao_step: moments accumulated
             # since step 1, so (1 - β^t) is the correct denominator
@@ -629,6 +632,13 @@ class SCAO(Optimizer):
             v_hat  = exp_avg_sq   / bc2
             update = (m_hat + (1.0 - beta3) * dm_hat) / v_hat.sqrt().add_(eps)
 
+            # R4: element-wise SNR mask applied to the final update direction.
+            # Evaluated after moments are updated so the SNR estimate reflects current
+            # signal quality (avoids cold-start bias). Zeroes update components where
+            # |m| / sqrt(v) < gsnr_threshold, suppressing high-variance low-signal dirs.
+            if self._use_gsnr_clip:
+                update = _gsnr_clip(update, exp_avg, exp_avg_sq, eps, self._gsnr_threshold)
+
             trust = self._lars_scale(p, update, lars_coeff, weight_decay) if lars_coeff > 0 else 1.0
             # `update` already contains bias-corrected m_hat (= exp_avg / bc1).
             # Dividing by bc1 here would apply bias correction twice — use lr*trust only.
@@ -639,11 +649,20 @@ class SCAO(Optimizer):
     # -----------------------------------------------------------------------
 
     def _update_precond_async(self, precond: SparsePreconditioner, grad: Tensor) -> None:
+        """
+        Trigger async curvature update. Detach and clone to avoid holding
+        references to the original grad tensor which might be needed for
+        other param groups or overlapping steps.
+        """
+        # Detach ensures we don't hold the graph. 
+        # Clone ensures the data is isolated for the async stream.
+        g_detached = grad.detach()
         if self._precond_stream is not None:
+            g_update = g_detached.clone()
             with torch.cuda.stream(self._precond_stream):
-                precond.update_curvature(grad.detach().clone())
+                precond.update_curvature(g_update)
         else:
-            precond.update_curvature(grad.detach())
+            precond.update_curvature(g_detached)
 
     @staticmethod
     def _curvature_clip(
@@ -858,6 +877,7 @@ def scao_3b(model, lr: float = 2e-4, **kw) -> SCAO:
     return SCAO(
         model.parameters(), lr=lr,
         warmup_steps=50,
+        blend_steps=30,
         precond_freq=10,
         dynamic_sparsity=True,
         adaptive_warmup=True,
@@ -891,8 +911,9 @@ def scao_40b(model, lr: float = 5e-5, **kw) -> SCAO:
     """14B–70B params. 4–8×A100/H100."""
     return SCAO(
         model.parameters(), lr=lr,
-        warmup_steps=150,
-        precond_freq=30,
+        warmup_steps=100,
+        blend_steps=50,
+        precond_freq=20,
         dynamic_sparsity=True,
         adaptive_warmup=True,
         lazy_precond=True,          # saves 60-80% of matrix inversions
@@ -927,4 +948,55 @@ def scao_125b(model, lr: float = 2e-5, **kw) -> SCAO:
         lookahead_k=10,
         async_precond=True,
         **kw,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scale Presets (v3)
+# ---------------------------------------------------------------------------
+
+def scao_sub1b(model_or_params, lr=1e-3, **kwargs):
+    """Preset for models < 1B params (Balanced)."""
+    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
+    return SCAO(params, lr=lr, k_max=64, use_int8_ema=False, **kwargs)
+
+def scao_1b(model_or_params, lr=1e-3, **kwargs):
+    """Preset for ~1B models (Memory-efficient)."""
+    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
+    return SCAO(params, lr=lr, k_max=48, use_int8_ema=True, async_precond=True, **kwargs)
+
+def scao_3b(model_or_params, lr=3e-4, **kwargs):
+    """Preset for ~3B models (Aggressive compression)."""
+    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
+    return SCAO(params, lr=lr, k_max=32, use_int8_ema=True, async_precond=True, warmup_steps=20, blend_steps=10, **kwargs)
+
+def scao_7b(model_or_params, lr=1e-4, **kwargs):
+    """Preset for ~7B models (Max stability)."""
+    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
+    return SCAO(params, lr=lr, k_max=24, use_int8_ema=True, async_precond=False, dynamic_sparsity=False, **kwargs)
+
+def scao_40b(model_or_params, lr=1e-4, **kwargs):
+    """Preset for ~40B models (Lazy precond & gSNR)."""
+    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
+    return SCAO(
+        params, lr=lr, k_max=16, 
+        use_int8_ema=True, 
+        async_precond=True, 
+        lazy_precond=True, 
+        use_gsnr_clip=True, 
+        **kwargs
+    )
+
+def scao_125b(model_or_params, lr=5e-5, **kwargs):
+    """Preset for ~125B models (Maximum throughput & offload-friendly)."""
+    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
+    return SCAO(
+        params, lr=lr, k_max=8, 
+        use_int8_ema=True, 
+        async_precond=True, 
+        lazy_precond=True, 
+        lazy_max_skip=100,
+        use_gsnr_clip=True, 
+        adaptive_rank=True,
+        **kwargs
     )

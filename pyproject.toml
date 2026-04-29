@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scao"
-version = "0.1.1"
+version = "0.2.0"
 description = "Sparse Curvature-Aware Adaptive Optimizer — second-order training at near-AdamW cost"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,7 +15,7 @@ keywords = [
   "kronecker", "shampoo", "fisher-information", "llm", "transformer",
 ]
 authors = [
-  { name = "SCAO Authors" },
+  { name = "Danilo Souza" },
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -38,7 +38,7 @@ Homepage = "https://github.com/whispering3/scao"
 "Bug Tracker" = "https://github.com/whispering3/scao/issues"
 Documentation = "https://github.com/whispering3/scao#readme"
 Changelog = "https://github.com/whispering3/scao/blob/main/CHANGELOG.md"
-Paper = "https://arxiv.org/abs/XXXX.XXXXX"
+Paper = "https://doi.org/10.5281/zenodo.19839495"
 
 [project.optional-dependencies]
 dev = [
@@ -55,10 +55,16 @@ cuda = [
 hf = [
   "transformers>=4.30.0",
   "datasets>=2.0.0",
+  "peft",
+  "bitsandbytes",
+  "accelerate",
 ]
 all = [
   "transformers>=4.30.0",
   "datasets>=2.0.0",
+  "peft",
+  "bitsandbytes",
+  "accelerate",
   "mypy>=1.5",
   "ruff>=0.1",
 ]

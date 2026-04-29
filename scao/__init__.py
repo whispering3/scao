@@ -23,21 +23,24 @@ Quickstart
 Paper
 -----
 SCAO: Sparse Curvature-Aware Adaptive Optimization for Large-Scale Models
-NeurIPS 2026 (under review)
+Zenodo 2026
 """
 
-from .optimizer import SCAO
+from .optimizer import (
+    SCAO, scao_sub1b, scao_1b, scao_3b, scao_7b, scao_40b, scao_125b
+)
 from .preconditioner import SparsePreconditioner
 from .utils import matrix_power_neg_quarter, adaptive_rank
 from . import logging as scao_logging
 
-__version__ = "0.1.1"
-__author__ = "SCAO Authors"
+__version__ = "0.2.0"
+__author__ = "Danilo Souza"
 __license__ = "Apache-2.0"
 
 __all__ = [
     # Main API — this is all most users need
     "SCAO",
+    "scao_sub1b", "scao_1b", "scao_3b", "scao_7b", "scao_40b", "scao_125b",
     # Advanced / internals
     "SparsePreconditioner",
     "matrix_power_neg_quarter",

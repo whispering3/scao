@@ -3,7 +3,7 @@
 [![CI](https://github.com/whispering3/scao/actions/workflows/ci.yml/badge.svg)](https://github.com/whispering3/scao/actions)
 [![PyPI](https://img.shields.io/pypi/v/scao.svg)](https://pypi.org/project/scao)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Paper](https://img.shields.io/badge/paper-NeurIPS%202026-red)](paper/scao.pdf)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19870556.svg)](https://doi.org/10.5281/zenodo.19870556)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0%2B-orange)](https://pytorch.org)
 
@@ -12,13 +12,6 @@
 > **Now available on PyPI:** `pip install scao`
 
 ---
-
-## 🚀 Support the Research
-
-If you have endorsement rights on arXiv for **cs.LG** (Machine Learning), please consider endorsing our paper to help us share this work with the community:
-
-👉 **[Endorse SCAO on arXiv](https://arxiv.org/auth/endorse?x=X3VJ88)**
-
 
 ---
 
@@ -48,7 +41,6 @@ If you have endorsement rights on arXiv for **cs.LG** (Machine Learning), please
 
 ## Table of Contents
 
-- [🚀 Support the Research](#-support-the-research)
 1. [The Problem](#1-the-problem)
 2. [SCAO's Solution](#2-scaos-solution)
 3. [Algorithm](#3-algorithm)
@@ -116,6 +108,49 @@ The Kronecker curvature accumulators `L_ema` and `R_ema` are stored in **int8 wi
 | d=1600 (GPT-2 XL) | 19.5 MB | ~4.9 MB | **4×** |
 
 Enable with `SCAO(..., use_int8_ema=True)`. Eigendecomposition still runs in float32 (dequantized on-the-fly), so eigenvector precision is unchanged.
+
+---
+
+## 🌟 SCAO v2: Scale Presets
+
+Starting with v2, SCAO provides **Scale Presets** that automatically configure hyperparameters (k_max, sparsity, async updates) based on your model size. This is the recommended way to use SCAO:
+
+| Preset | Model Size | Best For | Key Settings |
+| :--- | :--- | :--- | :--- |
+| `scao_sub1b()` | < 1B | BERT, GPT-2, ViT | Balanced performance |
+| `scao_1b()` | 1B - 2B | TinyLlama, StableLM | Memory-efficient |
+| `scao_3b()` | 3B - 4B | Qwen-3B, Phi-3 | Aggressive compression |
+| `scao_7b()` | 7B - 14B | Llama-7B, Mistral | High stability |
+| `scao_40b()` | 30B - 70B | Mixtral, Llama-70B | Lazy updates & gSNR |
+| `scao_125b()` | 100B+ | GPT-3 scale, Llama-405B | Max throughput (Offload-ready) |
+
+> **Note**: The 16GB VRAM (T4) benchmarks are provided as an **efficiency validation baseline**. SCAO is designed for massive-scale distributed training on A100/H100 clusters, where its asynchronous preconditioning and state compression deliver unmatched throughput-to-convergence ratios.
+
+**Example Usage:**
+```python
+from scao import scao_3b
+
+# Automatically sets k_max=32, int8_ema=True, async_precond=False for memory safety
+optimizer = scao_3b(model, lr=2e-4)
+```
+
+---
+
+## 📊 Unified T4 Benchmark
+
+We provide a comprehensive benchmark suite in `scao_benchmarks_t4/` to validate performance on Google Colab T4 GPUs.
+
+### Features:
+*   **Synthetic Mode**: Test throughput on GPT-like models (125M to 760M).
+*   **QLoRA Mode**: Test real LLMs (3B, 7B) using 4-bit quantization and PEFT.
+*   **Competitors**: Head-to-head comparison against **AdamW, Shampoo, and Muon**.
+
+**Run it on Colab:**
+```bash
+python scao_benchmarks_t4/benchmark_t4.py --mode qlora --model_id "Qwen/Qwen2.5-3B" --steps 100
+```
+
+---
 
 ### Innovation 5 — CUDA Fused Kernels
 
@@ -668,6 +703,10 @@ scao/                               # Core library
     ├── __init__.py                 # fused_kronecker_precond(), int8_ema_update(), truncated_eigh()
     └── setup.py                    # nvcc build (sm_70/75/80/86/89/90)
 
+scao_benchmarks_t4/                 # Unified T4/Colab benchmark suite
+├── benchmark_t4.py                 # Main benchmark (Synthetic & QLoRA)
+└── results/                        # Benchmark output logs
+
 benchmark/                           # Self-contained runnable examples
 ├── train_local.py                  # Fine-tune GPT-2 125M with SCAO + LoRA (<8 GB VRAM)
 ├── train_1m.py                     # Full fine-tuning throughput benchmark on TinyStories-1M
@@ -685,7 +724,7 @@ scripts/
 └── scao_colab_benchmark.ipynb      # Colab GPU benchmark (125M / 350M)
 
 paper/
-└── scao.tex                        # NeurIPS 2026 paper source (LaTeX)
+└── scao.tex                        # SCAO paper source (LaTeX)
 
 results_v11.csv                     # 200-step benchmark (primary ablation baseline)
 results_v11_500.csv                 # 500-step benchmark (primary paper result)
@@ -709,31 +748,16 @@ results_scao_vs_adamw.csv           # Per-step training loss (Phase 1 analysis)
 If you use SCAO in your research, please cite:
 
 ```bibtex
-@inproceedings{scao2026,
+@software{scao2026,
   title     = {SCAO: Sparse Curvature-Aware Adaptive Optimization for Large-Scale Models},
-  author    = {Anonymous},
-  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  author    = {Danilo Souza},
   year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.19870556},
+  url       = {https://github.com/whispering3/scao}
 }
 ```
 
-SCAO builds on and extends:
-
-```bibtex
-@article{vyas2024soap,
-  title   = {SOAP: Improving and Stabilizing Shampoo using Adam},
-  author  = {Vyas, Nikhil and Morwani, Depen and Zhao, Rosie and others},
-  journal = {arXiv:2409.11321},
-  year    = {2024},
-}
-
-@inproceedings{gupta2018shampoo,
-  title     = {A Unified View of Adaptive Gradient Methods},
-  author    = {Gupta, Vineet and Koren, Tomer and Singer, Yoram},
-  booktitle = {NeurIPS},
-  year      = {2018},
-}
-```
 
 ---
 

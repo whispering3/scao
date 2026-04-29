@@ -23,7 +23,7 @@ Usage
 
 Metrics dict keys
 -----------------
-Standard (v1/v2):
+Standard (v1):
     step              : int   global optimizer step
     scao/rank_mean    : float mean preconditioner rank across layers
     scao/rank_min     : int   minimum rank
@@ -36,7 +36,7 @@ Standard (v1/v2):
                               returning a stale dequantized estimate.
     scao/precond_freq : int   configured precond_freq
 
-New in v3:
+New in v2:
     noise_std         : float current gradient noise injection std (annealed)
     global_norm_ema   : float slow EMA of mean per-layer gradient norm
                               (used by R2 dynamic sparsity and R5 adaptive rank)

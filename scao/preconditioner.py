@@ -391,30 +391,30 @@ class SparsePreconditioner:
         L_debiased = L_fp32 / max(bias_factor, eps)
         R_debiased = R_fp32 / max(bias_factor, eps)
 
-        # Fix 3 — adaptive Tikhonov regularization before inversion.
+        # Adaptive Tikhonov regularization before inversion.
         # eps_precond = 1e-4 * trace(L) / m ensures the matrix is always
         # well-conditioned relative to the current curvature scale.  This
         # prevents blow-up of S^{-1/4} in low-signal directions and is
         # more robust than a fixed eps across different model sizes/dtypes.
+        # Use clone() + diagonal().add_() to avoid allocating a full m×m or n×n
+        # identity matrix — significantly cheaper for large preconditioner dims.
         eps_l = max(eps, 1e-4 * L_debiased.trace().item() / self.m)
         eps_r = max(eps, 1e-4 * R_debiased.trace().item() / self.n)
-        L_reg = L_debiased + eps_l * torch.eye(self.m, device=self.device, dtype=_PRECOND_DTYPE)
-        R_reg = R_debiased + eps_r * torch.eye(self.n, device=self.device, dtype=_PRECOND_DTYPE)
+        L_reg = L_debiased.clone()
+        L_reg.diagonal().add_(eps_l)
+        R_reg = R_debiased.clone()
+        R_reg.diagonal().add_(eps_r)
 
-        # torch.linalg.eigh calls LAPACK which internally consumes the global
-        # PyTorch RNG state (it draws random starting vectors for iterative
-        # solvers).  Preserving and restoring the state ensures that curvature
-        # updates do NOT perturb the data-loading shuffle order — critical for
-        # fair comparison against AdamW in benchmarks.
+        # Preserve CPU RNG state so preconditioner updates do not perturb
+        # the data-loading shuffle order — important for fair benchmark comparisons.
         rng_state = torch.get_rng_state()
 
         # --- Left factor ---
         try:
             S_l_full, U_l_full = torch.linalg.eigh(L_reg)
         except torch.linalg.LinAlgError:
-            S_l_full, U_l_full = torch.linalg.eigh(
-                L_reg + eps * torch.eye(self.m, device=self.device, dtype=_PRECOND_DTYPE)
-            )
+            L_reg.diagonal().add_(eps)
+            S_l_full, U_l_full = torch.linalg.eigh(L_reg)
         S_l_full = S_l_full.flip(0).clamp(min=0.0)
         U_l_full = U_l_full.flip(1)
 
@@ -422,13 +422,12 @@ class SparsePreconditioner:
         try:
             S_r_full, U_r_full = torch.linalg.eigh(R_reg)
         except torch.linalg.LinAlgError:
-            S_r_full, U_r_full = torch.linalg.eigh(
-                R_reg + eps * torch.eye(self.n, device=self.device, dtype=_PRECOND_DTYPE)
-            )
+            R_reg.diagonal().add_(eps)
+            S_r_full, U_r_full = torch.linalg.eigh(R_reg)
         S_r_full = S_r_full.flip(0).clamp(min=0.0)
         U_r_full = U_r_full.flip(1)
 
-        # Restore RNG state so eigh does not corrupt data-shuffling seeds.
+        # Restore CPU RNG state.
         torch.set_rng_state(rng_state)
 
         # --- Adaptive rank selection ---
@@ -607,9 +606,9 @@ class SparsePreconditioner:
             return sum(blk.memory_bytes() for blk in self._blocks)
         if self.use_kronecker:
             if self.use_int8_ema:
-                # int8 EMA: 1 byte/element + 4 bytes scale per factor
-                total += self.L_ema_q.numel() + 4  # int8 + scale float
-                total += self.R_ema_q.numel() + 4
+                # int8 EMA: 1 byte/element (int8) + 8 bytes scale per factor (Python float64)
+                total += self.L_ema_q.numel() + 8
+                total += self.R_ema_q.numel() + 8
             else:
                 total += self.L_ema.numel() * self.L_ema.element_size()
                 total += self.R_ema.numel() * self.R_ema.element_size()
